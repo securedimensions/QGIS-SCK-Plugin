@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="12" fill="#041526"/>
+  <circle cx="32" cy="20" r="9" fill="none" stroke="#ffffff" stroke-width="4"/>
+  <path d="M32 29 v10" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+  <text x="32" y="58" text-anchor="middle" font-size="20" font-weight="700" font-family="Helvetica, Arial, sans-serif" fill="#ffffff">SCK</text>
+</svg>
