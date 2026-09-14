@@ -1,0 +1,51 @@
+name: Release QGIS Plugin
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Read the plugin name dynamically from metadata.txt to name the folder correctly
+      - name: Get Plugin Metadata
+        id: metadata
+        run: |
+          PLUGIN_NAME=$(grep -E "^name=" metadata.txt | cut -d'=' -f2 | xargs | tr '[:upper:]' '[:lower:]' | tr ' ' '_')
+          VERSION=$(grep -E "^version=" metadata.txt | cut -d'=' -f2 | xargs)
+          echo "plugin_name=$PLUGIN_NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # QGIS requires the ZIP to extract into a folder named after the plugin, not root files
+      - name: Package Plugin Archive
+        run: |
+          mkdir -p build/${{ steps.metadata.outputs.plugin_name }}
+          
+          # Copy all plugin source files while ignoring git/github metadata
+          rsync -av --progress . build/${{ steps.metadata.outputs.plugin_name }} \
+            --exclude '.git*' \
+            --exclude '.github' \
+            --exclude 'build' \
+            --exclude '.vscode' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc'
+            
+          cd build
+          zip -r ../${{ steps.metadata.outputs.plugin_name }}.v${{ steps.metadata.outputs.version }}.zip ${{ steps.metadata.outputs.plugin_name }}
+
+      - name: Upload Zip to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
