@@ -66,17 +66,19 @@ def observation_group_payload(config, values):
     """JSON-serializable ObservationGroup for MQTT topic v1.1/ObservationGroups."""
     result_time = values["result_time"]
     phenomenon_time = values["phenomenon_time"]
+    party_location_id = (config or {}).get("party_location_id")
     observations = []
     for spec in DATASTREAMS:
-        observations.append(
-            {
-                "phenomenonTime": phenomenon_time,
-                "resultTime": result_time,
-                "result": values[spec["sample_key"]],
-                "Datastream": {"@iot.id": config[spec["config_key"]]},
-                "FeatureOfInterest": {"@iot.id": config["foi_id"]},
-            }
-        )
+        observation = {
+            "phenomenonTime": phenomenon_time,
+            "resultTime": result_time,
+            "result": values[spec["sample_key"]],
+            "Datastream": {"@iot.id": config[spec["config_key"]]},
+            "FeatureOfInterest": {"@iot.id": config["foi_id"]},
+        }
+        if party_location_id is not None:
+            observation["PartyLocation"] = {"@iot.id": party_location_id}
+        observations.append(observation)
     return {
         "name": "OG %s" % result_time,
         "description": " ",
@@ -89,7 +91,7 @@ def observation_group_payload(config, values):
 
 
 class SetupWorker(QThread):
-    """Create Party / Thing / Datastreams / License on STAplus without blocking the UI."""
+    """Create or update Thing / Location / PartyLocation on STAplus without blocking the UI."""
 
     succeeded = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -103,9 +105,19 @@ class SetupWorker(QThread):
             from . import authenix
             from .sta import StaClient
 
+            params = dict(self.params)
+            location_only = bool(params.pop("location_only", False))
             session = authenix.load_session()
             client = StaClient(session)
-            config = client.setup_publishing(**self.params)
+            if location_only:
+                config = client.update_publish_location(
+                    params.get("config"),
+                    params.get("lat"),
+                    params.get("lon"),
+                    params.get("location_name"),
+                )
+            else:
+                config = client.setup_publishing(**params)
             self.succeeded.emit(config)
         except Exception:
             self.failed.emit(traceback.format_exc())

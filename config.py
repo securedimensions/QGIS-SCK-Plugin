@@ -21,6 +21,9 @@ MQTT_CREATE_SPEC = (
     "http://www.opengis.net/spec/iot_sensing/1.1/req/create-observations-via-mqtt/"
     "observations-creation"
 )
+DGGS_CORE_SPEC = "http://www.opengis.net/spec/sensorthings-dggs/1.0/conf/core"
+# H3 cell for a Datastream is the hex index at this resolution (marker location).
+H3_CELL_RESOLUTION = 9
 
 # Public AUTHENIX client "QGIS SCK Plugin" (authorization code + PKCE, no client_secret).
 # Access tokens cannot be refreshed in the background; the plugin re-opens the system browser.
@@ -57,6 +60,11 @@ MARKER_CONFIRMED_KEY = "marker_confirmed"
 MARKER_NAME_KEY = "marker_name"
 # Used when the Location name field is empty (STAplus Location.name).
 DEFAULT_LOCATION_NAME = "QGIS SCK marker"
+# STAplus PartyLocation.encodingType (ValueCode) and environment (EnvCode).
+PARTY_LOCATION_ENCODING = "application/geo+json"
+PARTY_LOCATION_ENVIRONMENT = "outdoor"
+# WGS84 degrees; ~0.1 m. Marker reuse compares Location / PartyLocation against this.
+MARKER_COORD_EPS = 1e-6
 # Dock label when no public OSM place is selected as FeatureOfInterest.
 DEFAULT_FOI_LABEL = "The World (no geometry)"
 FOI_JSON_KEY = "selected_foi_json"
@@ -95,6 +103,7 @@ SCK_SAMPLE_INTERVAL = 10
 SCK_PORT_KEY = "sck_port"
 # Last kit MAC written as Thing properties.sck_id (replaces the old numeric kit_id).
 SCK_ID_KEY = "sck_id"
+THING_NAME = "Smart Citizen Kit"
 CHART_WINDOW_S = 30 * 60
 DISPLAY_NAME_KEY = "party_display_name"
 LICENSE_ID_KEY = "license_template_id"

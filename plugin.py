@@ -49,6 +49,7 @@ from .config import (
     DEFAULT_LOCATION_NAME,
     FOI_JSON_KEY,
     MARKER_CONFIRMED_KEY,
+    MARKER_COORD_EPS,
     MARKER_LAT_KEY,
     MARKER_LON_KEY,
     MARKER_MAP_SCALE,
@@ -83,7 +84,7 @@ from .mqtt import MqttError, MqttPublisher
 from .publish import SetupWorker, apply_sample, observation_group_payload
 from .publish_dialog import PublishConsentDialog
 from .places import PlacesClickFilter, PlacesLayerStore, PlacesWorker
-from .sta import StaClient, StaError
+from .sta import StaClient, StaError, grid_system_from_landing
 
 
 def _dock_area():
@@ -268,7 +269,9 @@ class SckDock(QDockWidget):
         self.start_btn.setToolTip(self._start_publishing_tooltip(signed_in, ready))
         self.start_host.setToolTip(self.start_btn.toolTip())
         self.stop_btn.setEnabled(self.plugin.publishing)
-        if self.plugin.publishing:
+        if self.plugin.publishing and self.plugin.setup_busy():
+            self.publish_hint.setText("Updating Location and PartyLocation for the marker.")
+        elif self.plugin.publishing:
             self.publish_hint.setText("Publishing ObservationGroups to STAplus.")
         elif not signed_in:
             self.publish_hint.setText("Sign in to publish.")
@@ -488,10 +491,15 @@ class SckPlugin:
         log_info("STAplus SCK plugin loaded")
         log_info("STA endpoint: %s" % STA_URL)
         try:
-            broker = StaClient().mqtt_broker()
+            client = StaClient()
+            landing = client.landing_page()
+            broker = client.mqtt_broker(landing)
             log_info("MQTT broker from STA landing page: %s:%s (%s)" % (
                 broker["host"], broker["port"], broker["uri"]
             ))
+            grid_system = grid_system_from_landing(landing)
+            if grid_system:
+                log_info("DGGS gridSystem from STA landing page: %s" % grid_system)
         except Exception as err:
             log_warning("Could not read MQTT endpoint from STA landing page: %s" % err)
         session = authenix.load_session()
@@ -720,7 +728,29 @@ class SckPlugin:
     def on_setup_ready(self, config):
         """Connect MQTT after STAplus entities exist, then publish each kit sample."""
         self.setup_worker = None
+        relocating = bool(
+            self.publishing
+            and self.mqtt_publisher is not None
+            and self.mqtt_publisher.is_connected()
+        )
         self.publish_config = dict(config or {})
+        pretty = json.dumps(self.publish_config, indent=2, default=str)
+        log_success("Publishing setup:\n%s" % pretty)
+        if relocating:
+            if self.dock is not None:
+                self.dock.append_log(pretty)
+                self.dock.refresh()
+            self._note(
+                "Publishing to Thing %s at “%s” (PartyLocation %s)."
+                % (
+                    self.publish_config.get("thing_id"),
+                    self.publish_config.get("location_name"),
+                    self.publish_config.get("party_location_id"),
+                ),
+                Qgis.MessageLevel.Success,
+            )
+            self._maybe_relocate_publishing()
+            return
         try:
             session = authenix.load_session()
             host = self.publish_config.get("mqtt_host")
@@ -747,8 +777,6 @@ class SckPlugin:
             return
         self.mqtt_publisher = publisher
         self.publishing = True
-        pretty = json.dumps(self.publish_config, indent=2, default=str)
-        log_success("Publishing setup:\n%s" % pretty)
         if self.dock is not None:
             self.dock.append_log(pretty)
             self.dock.refresh()
@@ -757,9 +785,21 @@ class SckPlugin:
             % (self.publish_config.get("thing_id"), self.publish_config.get("sck_id")),
             Qgis.MessageLevel.Success,
         )
+        self._maybe_relocate_publishing()
 
     def on_setup_failed(self, error):
         self.setup_worker = None
+        if self.publishing and self.mqtt_publisher is not None:
+            if self.dock is not None:
+                self.dock.refresh()
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "STAplus setup failed",
+                "Could not switch to the new marker. Publishing continues at the previous site.\n\n%s"
+                % error,
+            )
+            log_error("STAplus relocate failed:\n%s" % error)
+            return
         self.publishing = False
         self.publish_config = None
         if self.dock is not None:
@@ -1247,6 +1287,64 @@ class SckPlugin:
             % (self.lat, self.lon, self.sta_location_name()),
             Qgis.MessageLevel.Success,
         )
+        if self.dock is not None:
+            self.dock.refresh()
+        self._maybe_relocate_publishing()
+
+    def _publish_site_matches_marker(self):
+        """True when the live marker name and position match the publishing Thing/PartyLocation."""
+        cfg = self.publish_config or {}
+        try:
+            plat = float(cfg["lat"])
+            plon = float(cfg["lon"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if self.lat is None or self.lon is None:
+            return False
+        if abs(plat - float(self.lat)) > MARKER_COORD_EPS or abs(plon - float(self.lon)) > MARKER_COORD_EPS:
+            return False
+        return (cfg.get("location_name") or "") == self.sta_location_name()
+
+    def _maybe_relocate_publishing(self):
+        """If publishing and the confirmed marker changed, add Location and/or PartyLocation."""
+        if not self.publishing or self.publish_config is None or self.setup_busy():
+            return
+        if not self.marker_confirmed or self.lat is None or self.lon is None:
+            return
+        if self._publish_site_matches_marker():
+            return
+        self._relocate_publishing()
+
+    def _relocate_publishing(self):
+        """Keep MQTT and the Thing. Add a Location and PartyLocation for the new marker."""
+        try:
+            authenix.ensure_fresh_session()
+        except (authenix.AuthError, StaError) as err:
+            self._fail(
+                "Could not switch to the new marker",
+                err,
+                sign_out=isinstance(err, authenix.AuthError),
+            )
+            return
+        except Exception as err:
+            self._fail("Could not switch to the new marker", err)
+            return
+        params = {
+            "location_only": True,
+            "config": dict(self.publish_config or {}),
+            "lat": self.lat,
+            "lon": self.lon,
+            "location_name": self.sta_location_name(),
+        }
+        self._stop_setup_worker()
+        self.setup_worker = SetupWorker(params, self.iface.mainWindow())
+        self.setup_worker.succeeded.connect(self.on_setup_ready)
+        self.setup_worker.failed.connect(self.on_setup_failed)
+        self._note(
+            "Updating STAplus Location and PartyLocation for “%s”…"
+            % self.sta_location_name()
+        )
+        self.setup_worker.start()
         if self.dock is not None:
             self.dock.refresh()
 

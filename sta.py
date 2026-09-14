@@ -13,7 +13,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, see <https://www.gnu.org/licenses/>.
 
-"""STAplus HTTP client used to set up Party, Thing, FoI, License, and SCK Datastreams."""
+"""STAplus HTTP client used to set up Party, Thing, FoI, License, PartyLocation, and SCK Datastreams."""
 
 import json
 import logging
@@ -23,7 +23,19 @@ import requests
 
 from . import authenix
 from .catalog import DATASTREAMS, OBSERVED_PROPERTIES, OM_MEASUREMENT, SENSORS
-from .config import DEFAULT_LOCATION_NAME, ELEVATION_API_URL, MQTT_CREATE_SPEC, STA_URL
+from .config import (
+    DEFAULT_LOCATION_NAME,
+    DGGS_CORE_SPEC,
+    ELEVATION_API_URL,
+    H3_CELL_RESOLUTION,
+    MARKER_COORD_EPS,
+    MQTT_CREATE_SPEC,
+    PARTY_LOCATION_ENCODING,
+    PARTY_LOCATION_ENVIRONMENT,
+    STA_URL,
+    THING_NAME,
+)
+from .h3cell import latlng_to_cell
 
 _logger = logging.getLogger("sck.sta")
 
@@ -88,6 +100,31 @@ def mqtt_broker_from_landing(landing):
             return parsed
     raise StaError(
         "STAplus landing page has no MQTT endpoint under %s" % MQTT_CREATE_SPEC
+    )
+
+
+def grid_system_from_landing(landing):
+    """DGGS gridSystem from serverSettings under sensorthings-dggs core, or None."""
+    settings = (landing or {}).get("serverSettings") or {}
+    block = settings.get(DGGS_CORE_SPEC)
+    if isinstance(block, dict):
+        grid = str(block.get("gridSystem") or "").strip()
+        if grid:
+            return grid
+    return None
+
+
+def cell_id_for_marker(grid_system, lat, lon, resolution=H3_CELL_RESOLUTION):
+    """Cell @iot.id for the marker. H3 uses the hex index; other grids are unsupported."""
+    if not grid_system:
+        return None
+    if grid_system.upper() == "H3":
+        try:
+            return latlng_to_cell(lat, lon, resolution)
+        except (TypeError, ValueError) as err:
+            raise StaError("Could not encode H3 Cell id: %s" % err) from err
+    raise StaError(
+        "Unsupported DGGS gridSystem %r (this plugin encodes H3 cell ids)." % grid_system
     )
 
 
@@ -175,9 +212,11 @@ class StaClient:
         """GET the STAplus root document (public read, no Bearer token)."""
         return self.get("")
 
-    def mqtt_broker(self):
+    def mqtt_broker(self, landing=None):
         """MQTT host/port from landing-page create-observations-via-mqtt endpoints."""
-        broker = mqtt_broker_from_landing(self.landing_page())
+        if landing is None:
+            landing = self.landing_page()
+        broker = mqtt_broker_from_landing(landing)
         _logger.info("STA landing page MQTT broker %s:%s (%s)", broker["host"], broker["port"], broker["uri"])
         return broker
 
@@ -191,8 +230,14 @@ class StaClient:
         foi_spec=None,
         license_id=None,
         attribution_text="",
+        license_iot_id=None,
     ):
-        """Create Party, Thing (sck_id=MAC), License instance if needed, and eight Datastreams."""
+        """Create Party, Thing, Location, PartyLocation, License instance if needed, and eight Datastreams.
+
+        One Thing per Party and kit MAC (name is always Smart Citizen Kit). A marker
+        position change adds a Location on that Thing. A marker name or position change
+        creates a new PartyLocation. Existing Locations are never patched.
+        """
         sck_id = str(sck_id or "").strip()
         if not sck_id:
             raise StaError("Connect the Smart Citizen Kit so its MAC can be used as sck_id.")
@@ -203,15 +248,30 @@ class StaClient:
         display_name = (display_name or "").strip() or (
             user.get("preferred_username") or user.get("name") or "QGIS SCK user"
         )
-        license_entity = self.resolve_publish_license(license_id, attribution_text, display_name)
-        license_iot = license_entity.get("@iot.id")
+        site_name = _location_name(location_name)
+        if license_iot_id is not None:
+            license_iot = license_iot_id
+        else:
+            license_entity = self.resolve_publish_license(license_id, attribution_text, display_name)
+            license_iot = license_entity.get("@iot.id")
         party = self._ensure_party(display_name, sub)
-        thing = self._ensure_thing(party, sck_id=sck_id)
+        thing = self._ensure_thing(party, sck_id=sck_id, lat=lat, lon=lon, location_name=site_name)
         thing = self._prepare_publish_thing(thing, sck_id)
-        thing = self.set_thing_location(thing, lat, lon, name=location_name)
         foi = self.ensure_feature_of_interest(foi_spec)
         ops = self._ensure_sck_observed_properties()
         sensors = self._ensure_sck_sensors()
+        landing = self.landing_page()
+        grid_system = grid_system_from_landing(landing)
+        cell_id = cell_id_for_marker(grid_system, lat, lon)
+        if cell_id:
+            _logger.info(
+                "DGGS gridSystem=%s Cell @iot.id=%s resolution=%s Point [%s, %s]",
+                grid_system,
+                cell_id,
+                H3_CELL_RESOLUTION,
+                lon,
+                lat,
+            )
         ds_ids = {}
         for spec in DATASTREAMS:
             created = self._create_sck_datastream(
@@ -221,19 +281,29 @@ class StaClient:
                 license_id=license_iot,
                 observed_property_id=ops[spec["observed_property"]],
                 sensor_id=sensors[spec["sensor"]],
+                cell_id=cell_id,
             )
             ds_ids[spec["config_key"]] = created.get("@iot.id")
         elevation = self._lookup_elevation(lat, lon)
-        broker = self.mqtt_broker()
+        party_location = self._ensure_party_location(
+            party, lat, lon, elevation=elevation
+        )
+        broker = self.mqtt_broker(landing)
         config = {
             "thing_id": thing.get("@iot.id"),
             "party_id": party.get("@iot.id"),
             "party_display_name": party.get("displayName"),
+            "party_location_id": party_location.get("@iot.id"),
             "sck_id": sck_id,
             "license_id": license_iot,
             "license_template_id": license_id,
             "foi_id": foi.get("@iot.id"),
+            "cell_id": cell_id,
+            "grid_system": grid_system,
             "elevation": elevation,
+            "lat": float(lat),
+            "lon": float(lon),
+            "location_name": site_name,
             "mqtt_host": broker["host"],
             "mqtt_port": broker["port"],
             "mqtt_uri": broker["uri"],
@@ -243,13 +313,13 @@ class StaClient:
         return config
 
     def _prepare_publish_thing(self, thing, sck_id):
-        """Name the Thing like the desktop app and keep properties.sck_id = MAC."""
+        """Name the Thing Smart Citizen Kit and keep properties.sck_id = MAC."""
         props = dict(thing.get("properties") or {})
         props["plugin"] = "sck"
         props["source"] = props.get("source") or "qgis"
         props["sck_id"] = sck_id
         payload = {
-            "name": "Smart Citizen Kit 2.1",
+            "name": THING_NAME,
             "description": "The Smart Citizen Kit that publishes on STAplus",
             "properties": props,
         }
@@ -293,7 +363,9 @@ class StaClient:
             _logger.info("Created Sensor %s @iot.id=%s", spec["name"], ids[key])
         return ids
 
-    def _create_sck_datastream(self, spec, party, thing, license_id, observed_property_id, sensor_id):
+    def _create_sck_datastream(
+        self, spec, party, thing, license_id, observed_property_id, sensor_id, cell_id=None
+    ):
         """Always create a new measurement Datastream for this publish session."""
         payload = {
             "name": spec["name"],
@@ -307,49 +379,93 @@ class StaClient:
         }
         if license_id is not None:
             payload["License"] = {"@iot.id": license_id}
+        if cell_id:
+            payload["Cell"] = {"@iot.id": cell_id}
         created = self.post("Datastreams", payload)
         _logger.info(
-            "Created Datastream @iot.id=%s name=%s",
+            "Created Datastream @iot.id=%s name=%s Cell=%s",
             created.get("@iot.id"),
             spec["name"],
+            cell_id or "(none)",
         )
         return created
 
     def set_thing_location(self, thing, lat, lon, name=None):
-        """Set or replace the Thing's Location with a GeoJSON Point [lon, lat]."""
+        """Reuse a matching Location, otherwise POST a new one. Never patch an existing Location."""
         lat = float(lat)
         lon = float(lon)
         thing_id = thing.get("@iot.id")
         if thing_id is None:
             raise StaError("Cannot set Location: Thing has no @iot.id.")
-        payload = _location_payload(lat, lon, name)
-        locations = thing.get("Locations") or []
-        location = locations[0] if isinstance(locations, list) and locations else None
-        location_id = location.get("@iot.id") if isinstance(location, dict) else None
-        if location_id is not None:
-            self.patch(_entity_path("Locations", location_id), payload)
+        site_name = _location_name(name)
+        if _thing_has_location(thing, lat, lon, site_name):
             _logger.info(
-                "Updated Location @iot.id=%s name=%s to Point [%s, %s]",
-                location_id,
-                payload["name"],
-                lon,
-                lat,
-            )
-        else:
-            created = self.post(_entity_path("Things", thing_id) + "/Locations", payload)
-            location_id = created.get("@iot.id")
-            _logger.info(
-                "Created Location @iot.id=%s name=%s for Thing @iot.id=%s Point [%s, %s]",
-                location_id,
-                payload["name"],
+                "Reusing Location on Thing @iot.id=%s name=%s Point [%s, %s]",
                 thing_id,
+                site_name,
                 lon,
                 lat,
             )
+            return thing
+        payload = _location_payload(lat, lon, site_name)
+        created = self.post(_entity_path("Things", thing_id) + "/Locations", payload)
+        _logger.info(
+            "Added Location @iot.id=%s name=%s to Thing @iot.id=%s Point [%s, %s]",
+            created.get("@iot.id"),
+            payload["name"],
+            thing_id,
+            lon,
+            lat,
+        )
         return self.get(
             _entity_path("Things", thing_id),
             params={"$expand": "Locations,Party"},
         )
+
+    def update_publish_location(self, config, lat, lon, location_name=None):
+        """Add a Location to the current Thing and ensure a PartyLocation. Datastreams stay put."""
+        config = dict(config or {})
+        thing_id = config.get("thing_id")
+        party_id = config.get("party_id")
+        if thing_id is None:
+            raise StaError("Cannot add Location: publishing config has no thing_id.")
+        if party_id is None:
+            raise StaError("Cannot add PartyLocation: publishing config has no party_id.")
+        if lat is None or lon is None:
+            raise StaError("Confirm a Thing location on the map before publishing.")
+        site_name = _location_name(location_name)
+        thing = self.get(
+            _entity_path("Things", thing_id),
+            params={"$expand": "Locations,Party"},
+        )
+        thing = self.set_thing_location(thing, lat, lon, name=site_name)
+        elevation = self._lookup_elevation(lat, lon)
+        party_location = self._ensure_party_location(
+            {"@iot.id": party_id},
+            lat,
+            lon,
+            elevation=elevation,
+            reuse=False,
+        )
+        config.update(
+            {
+                "thing_id": thing.get("@iot.id"),
+                "party_location_id": party_location.get("@iot.id"),
+                "elevation": elevation,
+                "lat": float(lat),
+                "lon": float(lon),
+                "location_name": site_name,
+            }
+        )
+        _logger.info(
+            "Updated publish Location on Thing @iot.id=%s PartyLocation @iot.id=%s name=%s Point [%s, %s]",
+            config.get("thing_id"),
+            config.get("party_location_id"),
+            site_name,
+            lon,
+            lat,
+        )
+        return config
 
     def _ensure_party(self, display_name, sub):
         """Return the Party for this AUTHENIX subject, creating it if STAplus has none yet."""
@@ -424,10 +540,11 @@ class StaClient:
         _logger.info("Using License template @iot.id=%s", template.get("@iot.id"))
         return template
 
-    def _ensure_thing(self, party, sck_id=None):
-        """Return this Party's SCK Thing. properties.sck_id is the kit MAC when known."""
+    def _ensure_thing(self, party, sck_id=None, lat=None, lon=None, location_name=None):
+        """Reuse the Thing for this Party and kit MAC, or create one and add a Location."""
         party_id = party.get("@iot.id")
         sck_id = str(sck_id or "").strip()
+        site_name = _location_name(location_name)
         found = []
         if sck_id:
             found = self._query(
@@ -435,42 +552,76 @@ class StaClient:
                 "Party/id eq %s and properties/sck_id eq %s"
                 % (_odata_quote(str(party_id)), _odata_quote(sck_id)),
                 expand="Locations,Party",
-            )
-        if not found:
-            found = self._query(
-                "Things",
-                "Party/id eq %s and properties/plugin eq 'sck'" % _odata_quote(str(party_id)),
-                expand="Locations,Party",
-            )
-        if not found:
-            found = self._query(
-                "Things",
-                "name eq %s" % _odata_quote("QGIS SCK Test Thing"),
-                expand="Locations,Party",
+                top=100,
             )
         if found:
             thing = found[0]
-            _logger.info("Reusing Thing @iot.id=%s", thing.get("@iot.id"))
+            _logger.info(
+                "Reusing Thing @iot.id=%s for Party @iot.id=%s sck_id=%s",
+                thing.get("@iot.id"),
+                party_id,
+                sck_id,
+            )
             if sck_id:
                 thing = self._patch_thing_sck_id(thing, sck_id)
+            if lat is not None and lon is not None:
+                thing = self.set_thing_location(thing, lat, lon, name=site_name)
             return thing
 
         props = {"plugin": "sck", "source": "qgis"}
         if sck_id:
             props["sck_id"] = sck_id
         payload = {
-            "name": "QGIS SCK Test Thing",
-            "description": "Debug Thing owned by the acting STAplus Party",
+            "name": THING_NAME,
+            "description": "The Smart Citizen Kit that publishes on STAplus",
             "properties": props,
             "Party": {"@iot.id": party_id},
         }
         thing = self.post("Things", payload)
+        if lat is not None and lon is not None:
+            thing = self.set_thing_location(thing, lat, lon, name=site_name)
         _logger.info(
-            "Created Thing @iot.id=%s sck_id=%s",
+            "Created Thing @iot.id=%s sck_id=%s Location name=%s Point [%s, %s]",
             thing.get("@iot.id"),
             sck_id or "(none)",
+            site_name,
+            lon,
+            lat,
         )
         return thing
+
+    def _ensure_party_location(self, party, lat, lon, elevation=0, reuse=True):
+        """Reuse a PartyLocation at this WGS84 position, or create one.
+
+        PartyLocation has no name in the service model; the marker name is stored on
+        Location. A marker name or position change from the plugin creates a new entity
+        (reuse=False). Existing PartyLocations are never patched.
+        """
+        party_id = party.get("@iot.id")
+        if reuse:
+            found = self._query(
+                "PartyLocations",
+                "Party/id eq %s" % _odata_quote(str(party_id)),
+                top=100,
+            )
+            for item in found:
+                if _party_location_matches(item, lat, lon):
+                    _logger.info(
+                        "Reusing PartyLocation @iot.id=%s Point [%s, %s]",
+                        item.get("@iot.id"),
+                        lon,
+                        lat,
+                    )
+                    return item
+        payload = _party_location_payload(party_id, lat, lon, elevation=elevation)
+        created = self.post("PartyLocations", payload)
+        _logger.info(
+            "Created PartyLocation @iot.id=%s Point [%s, %s]",
+            created.get("@iot.id"),
+            lon,
+            lat,
+        )
+        return created
 
     def _patch_thing_sck_id(self, thing, sck_id):
         """Set Thing properties.sck_id to the kit MAC (replaces the old numeric kit_id)."""
@@ -610,15 +761,80 @@ class StaClient:
 
 def _location_payload(lat, lon, name=None):
     """STAplus Location body. name is required by STA 1.1 / FROST."""
-    location_name = (str(name) if name is not None else "").strip() or DEFAULT_LOCATION_NAME
-    if not location_name:
-        location_name = "QGIS SCK marker"
+    location_name = _location_name(name)
     return {
         "name": location_name,
         "description": "Location chosen on the QGIS map",
-        "encodingType": "application/geo+json",
+        "encodingType": PARTY_LOCATION_ENCODING,
         "location": {"type": "Point", "coordinates": [float(lon), float(lat)]},
     }
+
+
+def _party_location_payload(party_id, lat, lon, elevation=0):
+    """STAplus v1.1 PartyLocation body. Marker name is not a PartyLocation property."""
+    payload = {
+        "position": {"type": "Point", "coordinates": [float(lon), float(lat)]},
+        "encodingType": PARTY_LOCATION_ENCODING,
+        "environment": PARTY_LOCATION_ENVIRONMENT,
+        "Party": {"@iot.id": party_id},
+    }
+    if elevation is not None:
+        payload["elevation"] = float(elevation)
+    return payload
+
+
+def _location_name(name=None):
+    """STAplus Location.name from the marker, or the plugin default."""
+    location_name = (str(name) if name is not None else "").strip() or DEFAULT_LOCATION_NAME
+    return location_name or "QGIS SCK marker"
+
+
+def _geojson_point_coords(value):
+    """[lon, lat] from a GeoJSON Point or Feature, else None."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("type") == "Point" and isinstance(value.get("coordinates"), list):
+        return value.get("coordinates")
+    geometry = value.get("geometry")
+    if isinstance(geometry, dict) and geometry.get("type") == "Point":
+        coords = geometry.get("coordinates")
+        if isinstance(coords, list):
+            return coords
+    return None
+
+
+def _coords_match(coords, lat, lon, eps=MARKER_COORD_EPS):
+    """True when GeoJSON [lon, lat] matches the marker within eps degrees."""
+    if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+        return False
+    try:
+        return abs(float(coords[0]) - float(lon)) <= eps and abs(float(coords[1]) - float(lat)) <= eps
+    except (TypeError, ValueError):
+        return False
+
+
+def _iter_locations(thing):
+    """Location entities expanded on a Thing, or an empty list."""
+    locations = (thing or {}).get("Locations") or []
+    if not isinstance(locations, list):
+        return []
+    return [item for item in locations if isinstance(item, dict)]
+
+
+def _thing_has_location(thing, lat, lon, name=None):
+    """True when any Location on the Thing has the marker name and WGS84 point."""
+    expected = _location_name(name)
+    for location in _iter_locations(thing):
+        if (location.get("name") or "").strip() != expected:
+            continue
+        if _coords_match(_geojson_point_coords(location.get("location")), lat, lon):
+            return True
+    return False
+
+
+def _party_location_matches(entity, lat, lon):
+    """True when PartyLocation.position matches the marker WGS84 point."""
+    return _coords_match(_geojson_point_coords((entity or {}).get("position")), lat, lon)
 
 
 def _iot_id_from_self_link(url):
