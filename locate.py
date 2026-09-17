@@ -64,12 +64,12 @@ def _add_qt_plugin_paths():
     except Exception:
         return
     prefix = QgsApplication.prefixPath() or ""
-    plugin_path = ""
+    plugin_path = None
     if hasattr(QgsApplication, "pluginPath"):
         try:
-            plugin_path = QgsApplication.pluginPath() or ""
+            plugin_path = QgsApplication.pluginPath() or None
         except Exception:
-            plugin_path = ""
+            plugin_path = None
     contents = os.path.abspath(os.path.join(prefix, "..", "..")) if prefix else ""
     roots = [
         os.path.join(prefix, "plugins"),
@@ -246,14 +246,14 @@ class DeviceLocator(QObject):
         if self._cl is not None:
             try:
                 self._cl.stop()
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not stop CoreLocation session: %s", err)
         if self._source is None:
             return
         try:
             self._source.stopUpdates()
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not stop Qt Positioning updates: %s", err)
 
     def close(self):
         """Release OS location resources (plugin unload)."""
@@ -261,8 +261,8 @@ class DeviceLocator(QObject):
         if self._cl is not None:
             try:
                 self._cl.close()
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not close CoreLocation session: %s", err)
             self._cl = None
 
     def _finish_ok(self, lat, lon):

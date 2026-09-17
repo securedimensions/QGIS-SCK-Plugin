@@ -134,7 +134,7 @@ class StaClient:
     def __init__(self, session=None, base_url=STA_URL):
         """session must contain access_token from authenix (browser PKCE login)."""
         self.base_url = base_url.rstrip("/") + "/"
-        self.session = dict(session or authenix.load_session())
+        self.session = dict(session or authenix.load_session() or {})
         self._http = requests.Session()
         self._http.trust_env = False
         self._http.proxies = {}
@@ -229,7 +229,7 @@ class StaClient:
         location_name=None,
         foi_spec=None,
         license_id=None,
-        attribution_text="",
+        attribution_text=None,
         license_iot_id=None,
     ):
         """Create Party, Thing, Location, PartyLocation, License instance if needed, and eight Datastreams.
@@ -512,7 +512,7 @@ class StaClient:
         templates = [item for item in items if is_template_license(item)]
         return templates or items
 
-    def resolve_publish_license(self, template_id, attribution_text="", display_name=""):
+    def resolve_publish_license(self, template_id, attribution_text=None, display_name=None):
         """Use a template License, or clone it with attributionText when required."""
         template_id = str(template_id or "").strip()
         if not template_id:

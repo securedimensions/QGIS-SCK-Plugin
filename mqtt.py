@@ -424,8 +424,8 @@ class MqttPublisher:
             return
         try:
             sock.sendall(bytes([0xE0, 0x00]))
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not send MQTT DISCONNECT: %s", err)
         try:
             sock.close()
         except OSError:
@@ -538,7 +538,7 @@ def connect_with_token_retry(session=None, host=None, port=None):
     """CONNECT with the current access token. MQTT does not refresh tokens on its own."""
     if not host or not port:
         raise MqttError("MQTT host and port must come from the STAplus landing page.")
-    session = dict(session or authenix.load_session())
+    session = dict(session or authenix.load_session() or {})
     token = session.get("access_token") or ""
     if not token:
         raise MqttError("No access token. Sign in first.")

@@ -16,6 +16,7 @@
 """QGIS UI for STAplus SCK: dock panel, AUTHENIX sign-in, kit serial, and MQTT publish."""
 
 import json
+import logging
 import os
 import time
 import traceback
@@ -85,6 +86,8 @@ from .publish import SetupWorker, apply_sample, observation_group_payload
 from .publish_dialog import PublishConsentDialog
 from .places import PlacesClickFilter, PlacesLayerStore, PlacesWorker
 from .sta import StaClient, StaError, grid_system_from_landing
+
+_logger = logging.getLogger("sck.plugin")
 
 
 def _dock_area():
@@ -240,7 +243,7 @@ class SckDock(QDockWidget):
 
     def refresh(self):
         """Update status text and enable/disable buttons from the stored AUTHENIX session."""
-        session = authenix.load_session()
+        session = authenix.load_session() or {}
         token = session.get("access_token") or ""
         signed_in = bool(token)
         usable = authenix.token_usable(token, session.get("expires_at"))
@@ -424,7 +427,7 @@ class SckPlugin:
         self.map_tool = None
         self.lat = None
         self.lon = None
-        self.location_name = ""
+        self.location_name = None
         self.marker_confirmed = False
         self.selected_foi = None
         self.locator = None
@@ -437,8 +440,8 @@ class SckPlugin:
         self.serial_worker = None
         self.kit_connected = False
         self.serial_stopping = False
-        self.last_sck_port = ""
-        self.kit_mac = ""
+        self.last_sck_port = None
+        self.kit_mac = None
         self.publishing = False
         self.publish_config = None
         self.mqtt_publisher = None
@@ -502,7 +505,7 @@ class SckPlugin:
                 log_info("DGGS gridSystem from STA landing page: %s" % grid_system)
         except Exception as err:
             log_warning("Could not read MQTT endpoint from STA landing page: %s" % err)
-        session = authenix.load_session()
+        session = authenix.load_session() or {}
         if session.get("access_token"):
             user = session.get("user") or {}
             log_info(
@@ -560,8 +563,8 @@ class SckPlugin:
             self.zoom_control = None
         try:
             self.iface.mapCanvas().setToolTip("")
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not clear map canvas tooltip: %s", err)
         self._teardown_map_tool()
         if self.places_store is not None:
             self.places_store.clear()
@@ -622,7 +625,7 @@ class SckPlugin:
 
     def sign_out(self):
         """Clear QGIS OAuth2 tokens and open AUTHENIX logout (needs id_token_hint)."""
-        session = authenix.load_session()
+        session = authenix.load_session() or {}
         try:
             id_token = authenix.id_token_for_logout(session)
             url = authenix.logout_url(id_token)
@@ -680,10 +683,9 @@ class SckPlugin:
         user = session.get("user") or {}
         default_name = (
             self._read_display_name()
-            or ((party or {}).get("displayName") or "")
+            or (party or {}).get("displayName")
             or user.get("preferred_username")
             or user.get("name")
-            or ""
         )
         dialog = PublishConsentDialog(licenses, default_name, self.iface.mainWindow())
         try:
@@ -752,7 +754,7 @@ class SckPlugin:
             self._maybe_relocate_publishing()
             return
         try:
-            session = authenix.load_session()
+            session = authenix.load_session() or {}
             host = self.publish_config.get("mqtt_host")
             port = self.publish_config.get("mqtt_port")
             if not host or not port:
@@ -817,8 +819,8 @@ class SckPlugin:
         if publisher is not None:
             try:
                 publisher.disconnect()
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not disconnect MQTT publisher: %s", err)
         if was and not quiet:
             self._note("Publishing stopped. The kit can stay connected.")
         if self.dock is not None:
@@ -841,7 +843,7 @@ class SckPlugin:
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:
-            return str(settings.value(DISPLAY_NAME_KEY, "") or "").strip()
+            return str(settings.value(DISPLAY_NAME_KEY) or "").strip() or None
         finally:
             settings.endGroup()
 
@@ -967,12 +969,12 @@ class SckPlugin:
         self.serial_worker.finished_ok.connect(self.on_serial_finished)
         self.serial_worker.start()
 
-    def on_serial_connected(self, port, mac=""):
+    def on_serial_connected(self, port, mac=None):
         """Serial port opened, kit MAC read, and SCK monitor started."""
         self.kit_connected = True
         self.serial_stopping = False
         self.last_sck_port = port
-        self.kit_mac = (mac or "").strip()
+        self.kit_mac = (mac or "").strip() or None
         self._save_sck_port(port)
         if self.kit_mac:
             self._save_sck_id(self.kit_mac)
@@ -1150,8 +1152,8 @@ class SckPlugin:
             pass
         try:
             worker.stop()
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not stop serial worker: %s", err)
         if worker.isRunning():
             worker.wait(3000)
 
@@ -1160,7 +1162,7 @@ class SckPlugin:
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:
-            return str(settings.value(SCK_PORT_KEY, "") or "")
+            return str(settings.value(SCK_PORT_KEY) or "") or None
         finally:
             settings.endGroup()
 
@@ -1181,7 +1183,7 @@ class SckPlugin:
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:
-            return str(settings.value(SCK_ID_KEY, "") or "").strip()
+            return str(settings.value(SCK_ID_KEY) or "").strip() or None
         finally:
             settings.endGroup()
 
@@ -1262,8 +1264,8 @@ class SckPlugin:
     def _name_from_dock(self):
         """Current Location name from the dock, stripped; empty if none."""
         if self.dock is None:
-            return (self.location_name or "").strip()
-        return (self.dock.name_edit.text() or "").strip()
+            return (self.location_name or "").strip() or None
+        return (self.dock.name_edit.text() or "").strip() or None
 
     def sta_location_name(self):
         """STAplus Location.name: dock/saved text, or DEFAULT_LOCATION_NAME if empty."""
@@ -1463,8 +1465,8 @@ class SckPlugin:
             from qgis.gui import QgsMapToolZoom
             if isinstance(tool, QgsMapToolZoom):
                 return True
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("QgsMapToolZoom check failed: %s", err)
         return "Zoom" in type(tool).__name__
 
     def _skip_select_click(self):
@@ -1488,8 +1490,8 @@ class SckPlugin:
             self.cursor_hint.set_mode(text)
         try:
             self.iface.mapCanvas().setToolTip(text)
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not set map canvas tooltip: %s", err)
 
     def set_places_visible(self, visible):
         """Show or hide the SCK nearby places layer group."""
@@ -1519,7 +1521,7 @@ class SckPlugin:
         kind = str(props.get("kind") or "").strip()
         label = "%s (%s)" % (name, kind) if kind else name
         self._note("Feature of Interest: %s" % label, Qgis.MessageLevel.Success)
-        session = authenix.load_session()
+        session = authenix.load_session() or {}
         if authenix.token_usable(session.get("access_token"), session.get("expires_at")):
             self._apply_foi_to_sta()
         else:
@@ -1534,7 +1536,7 @@ class SckPlugin:
         if self.places_store is not None:
             self.places_store.highlight(None)
         self._note("Using %s as Feature of Interest." % DEFAULT_FOI_LABEL)
-        session = authenix.load_session()
+        session = authenix.load_session() or {}
         if authenix.token_usable(session.get("access_token"), session.get("expires_at")):
             self._apply_foi_to_sta()
         if self.dock is not None:
@@ -1599,7 +1601,7 @@ class SckPlugin:
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:
-            raw = settings.value(FOI_JSON_KEY, "")
+            raw = settings.value(FOI_JSON_KEY)
         finally:
             settings.endGroup()
         feature = None
@@ -1651,7 +1653,7 @@ class SckPlugin:
             lat = settings.value(MARKER_LAT_KEY, None)
             lon = settings.value(MARKER_LON_KEY, None)
             confirmed = settings.value(MARKER_CONFIRMED_KEY, False)
-            stored_name = settings.value(MARKER_NAME_KEY, "")
+            stored_name = settings.value(MARKER_NAME_KEY)
         finally:
             settings.endGroup()
         try:
@@ -1662,9 +1664,9 @@ class SckPlugin:
             self.lon = None
         if isinstance(confirmed, str):
             confirmed = confirmed.lower() in ("1", "true", "yes")
-        self.location_name = str(stored_name or "").strip()
+        self.location_name = str(stored_name or "").strip() or None
         if self.dock is not None:
-            self.dock.name_edit.setText(self.location_name)
+            self.dock.name_edit.setText(self.location_name or "")
         self.marker_confirmed = bool(confirmed) and self.lat is not None and self.lon is not None
         if self.lat is None or self.lon is None:
             return

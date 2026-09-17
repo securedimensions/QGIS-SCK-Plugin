@@ -117,8 +117,8 @@ def _style_layer(layer, kind):
     layer.setRenderer(QgsSingleSymbolRenderer(symbol))
     try:
         layer.setSelectionColor(QColor(255, 190, 0, 180))
-    except Exception:
-        pass
+    except Exception as err:
+        _logger.debug("Could not set place-layer selection color: %s", err)
 
 
 def _feature_attr(qgs_feature, name):
@@ -238,8 +238,8 @@ class PlacesLayerStore(QObject):
             return
         try:
             group.setItemVisibilityChecked(bool(visible))
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not set nearby-places group visibility: %s", err)
 
     def _root(self):
         return QgsProject.instance().layerTreeRoot()
@@ -271,8 +271,8 @@ class PlacesLayerStore(QObject):
             return
         try:
             root.removeChildNode(group)
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not remove nearby-places group: %s", err)
 
     def set_collection(self, collection):
         """Replace place layers with features from a GeoJSON FeatureCollection."""
@@ -368,8 +368,8 @@ def _map_point_from_pixel(canvas, pos):
     y = int(pos.y())
     try:
         return canvas.mapSettings().mapToPixel().toMapCoordinates(x, y)
-    except Exception:
-        pass
+    except Exception as err:
+        _logger.debug("mapToPixel toMapCoordinates failed: %s", err)
     if hasattr(canvas, "xyCoordinates"):
         try:
             return canvas.xyCoordinates(pos)
@@ -425,7 +425,8 @@ def pick_place_at(canvas, store, pos):
                 if geom.intersects(QgsGeometry.fromRect(rect)):
                     hit = feat
                     break
-            except Exception:
+            except Exception as err:
+                _logger.debug("Could not test place-feature intersection: %s", err)
                 continue
         if hit is None:
             continue

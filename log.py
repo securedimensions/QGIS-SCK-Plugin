@@ -72,12 +72,12 @@ class QgsLogHandler(logging.Handler):
 
     def emit(self, record):
         """Forward one Python log record to QgsMessageLog."""
-        if not _on_gui_thread():
+        if record.levelno < logging.INFO or not _on_gui_thread():
             return
         try:
             QgsMessageLog.logMessage(self.format(record), LOG_TAG, _level(record.levelno))
         except Exception:
-            pass
+            self.handleError(record)
 
 
 def install_python_logging():
@@ -87,6 +87,7 @@ def install_python_logging():
     if any(isinstance(handler, QgsLogHandler) for handler in logger.handlers):
         return logger
     handler = QgsLogHandler()
+    handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
     logger.propagate = False

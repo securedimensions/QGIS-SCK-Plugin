@@ -328,8 +328,8 @@ class MarkerChartOverlay(QFrame):
                 continue
             try:
                 signal.connect(self.reposition)
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not connect canvas.%s: %s", name, err)
 
     def close_overlay(self):
         """Plugin unload."""
@@ -341,8 +341,8 @@ class MarkerChartOverlay(QFrame):
                 continue
             try:
                 signal.disconnect(self.reposition)
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not disconnect canvas.%s: %s", name, err)
         self.setParent(None)
         self.deleteLater()
 

@@ -66,8 +66,8 @@ def map_point_to_pixel(canvas, map_point):
     try:
         pixel = canvas.mapSettings().mapToPixel().transform(QgsPointXY(map_point))
         return float(pixel.x()), float(pixel.y())
-    except Exception:
-        pass
+    except Exception as err:
+        _logger.debug("mapToPixel transform failed: %s", err)
     if hasattr(canvas, "getCoordinateTransform"):
         pixel = canvas.getCoordinateTransform().transform(QgsPointXY(map_point))
         return float(pixel.x()), float(pixel.y())

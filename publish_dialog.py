@@ -36,7 +36,7 @@ from .sta import is_attribution_license, is_template_license
 class PublishConsentDialog(QDialog):
     """Collect displayName, a template License, optional attribution text, and consent."""
 
-    def __init__(self, licenses, display_name="", parent=None):
+    def __init__(self, licenses, display_name=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Start publishing")
         self.setMinimumWidth(460)

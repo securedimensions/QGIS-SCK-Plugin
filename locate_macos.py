@@ -277,8 +277,8 @@ def _location_wgs84(loc):
         accuracy = float(_msg(loc, "horizontalAccuracy", restype=c_double))
         if accuracy < 0:
             return None
-    except Exception:
-        pass
+    except Exception as err:
+        _logger.debug("CoreLocation horizontalAccuracy failed: %s", err)
     parsed = _coordinate_via_invocation(loc)
     if parsed:
         return parsed
@@ -315,8 +315,8 @@ class CoreLocationSession:
         _msg(manager, "retain")
         try:
             _msg(manager, "setDesiredAccuracy:", restype=None, argtypes=[c_double], args=(100.0,))
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("setDesiredAccuracy failed: %s", err)
         delegate_cls = _register_delegate_class()
         delegate = _msg(_msg(delegate_cls, "alloc"), "init")
         _msg(delegate, "retain")
@@ -333,8 +333,8 @@ class CoreLocationSession:
             return _STATUS_NOT_DETERMINED
         try:
             return int(_msg(manager, "authorizationStatus", restype=c_int))
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("instance authorizationStatus failed: %s", err)
         try:
             return int(_msg(_cls("CLLocationManager"), "authorizationStatus", restype=c_int))
         except Exception:
@@ -395,8 +395,8 @@ class CoreLocationSession:
             return
         try:
             _msg(self.manager, "stopUpdatingLocation", restype=None)
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("stopUpdatingLocation failed: %s", err)
 
     def close(self):
         """Release the manager and delegate (plugin unload)."""
@@ -405,18 +405,18 @@ class CoreLocationSession:
             _sessions_by_delegate.pop(_ptr_key(self.delegate), None)
             try:
                 _msg(self.manager, "setDelegate:", restype=None, argtypes=[c_void_p], args=(None,))
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not clear CoreLocation delegate: %s", err)
             try:
                 _msg(self.delegate, "release")
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not release CoreLocation delegate: %s", err)
             self.delegate = None
         if self.manager:
             try:
                 _msg(self.manager, "release")
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not release CoreLocation manager: %s", err)
             self.manager = None
 
     def read_wgs84(self):

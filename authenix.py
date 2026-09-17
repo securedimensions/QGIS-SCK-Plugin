@@ -65,9 +65,6 @@ _http_lock = threading.Lock()
 # Match QGIS OAuth2: requestTimeout (60s) * 5 for the nested browser loop.
 _LOOPBACK_TIMEOUT_S = 300
 
-ID_TOKEN_HEADER = "X-Id-Token"
-REFRESH_TOKEN_HEADER = "X-Refresh-Token"
-EXPIRES_IN_HEADER = "X-Expires-In"
 # QGIS O2 encrypts its token cache with this fixed SimpleCrypt key.
 O2_ENCRYPTION_KEY = "12345678"
 _CRYPTO_FLAG_COMPRESSION = 0x01
@@ -120,6 +117,14 @@ def token_prefix(token):
     if not text:
         return "(none)"
     return "%s… (%s chars)" % (text[:12], len(text))
+
+
+def _token_or_none(value):
+    """Missing or blank token → None. Empty string is not a token."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _on_gui_thread():
@@ -201,10 +206,6 @@ def _oauth2_config_dict():
         "configType": 1,
         "grantFlow": 3,
         "persistToken": True,
-        "extraTokens": {
-            "id_token": ID_TOKEN_HEADER,
-            "expires_in": EXPIRES_IN_HEADER,
-        },
         "queryPairs": {"state": secrets.token_urlsafe(24)},
         "redirectHost": OAUTH_REDIRECT_HOST,
         "redirectPort": OAUTH_REDIRECT_PORT,
@@ -242,11 +243,11 @@ def _ensure_master_password(manager):
 
 
 def _stored_authcfg_id():
-    """Auth config id last stored under SETTINGS_GROUP, or empty if none."""
+    """Auth config id last stored under SETTINGS_GROUP, or None if none."""
     settings = QgsSettings()
     settings.beginGroup(SETTINGS_GROUP)
     try:
-        return (settings.value("authcfg_id", "") or "").strip()
+        return _token_or_none(settings.value("authcfg_id"))
     finally:
         settings.endGroup()
 
@@ -256,7 +257,11 @@ def _save_authcfg_id(authcfg_id):
     settings = QgsSettings()
     settings.beginGroup(SETTINGS_GROUP)
     try:
-        settings.setValue("authcfg_id", authcfg_id or "")
+        authcfg_id = _token_or_none(authcfg_id)
+        if authcfg_id:
+            settings.setValue("authcfg_id", authcfg_id)
+        else:
+            settings.remove("authcfg_id")
     finally:
         settings.endGroup()
 
@@ -279,8 +284,8 @@ def _config_exists(manager, authcfg_id):
     try:
         if authcfg_id in list(manager.configIds() or []):
             return True
-    except Exception:
-        pass
+    except Exception as err:
+        _logger.debug("configIds() lookup failed: %s", err)
     try:
         return authcfg_id in (manager.availableAuthMethodConfigs() or {})
     except Exception:
@@ -381,7 +386,6 @@ def _introspect_access_token(access_token):
             AUTHENIX_TOKENINFO,
             data={
                 "token": access_token,
-                "token_type_hint": "access_token",
                 "client_id": OAUTH_CLIENT_ID,
             },
             headers={
@@ -441,7 +445,7 @@ def _expires_at_from_tokeninfo(access_token):
 
 def _o2_crypt_keys():
     """Candidate SimpleCrypt keys derived from the QGIS O2 hardcoded passphrase."""
-    digest = hashlib.sha1(O2_ENCRYPTION_KEY.encode("latin1")).digest()
+    digest = hashlib.sha256(O2_ENCRYPTION_KEY.encode("latin1")).digest()
     keys = [0]
     if len(digest) >= 8:
         keys.append(int.from_bytes(digest[:8], "little"))
@@ -519,9 +523,11 @@ def _simplecrypt_decrypt(cipher_text, key):
 
 def _decrypt_o2_value(cipher_text):
     """Decrypt a cache value, or return it unchanged if it is already plaintext."""
-    text = (cipher_text or "").strip()
+    if cipher_text is None:
+        return None
+    text = str(cipher_text).strip()
     if not text:
-        return ""
+        return None
     if _looks_like_secret(text) and not text.startswith("{"):
         if " " not in text and len(text) < 4000:
             try:
@@ -532,7 +538,7 @@ def _decrypt_o2_value(cipher_text):
         plain = _simplecrypt_decrypt(text, key)
         if plain and (_looks_like_secret(plain) or plain.isdigit()):
             return plain
-    return ""
+    return None
 
 
 def _qt_ini_format():
@@ -553,12 +559,12 @@ def _oauth2_token_cache_paths(authcfg_id):
             try:
                 path = QgsAuthOAuth2Config.tokenCachePath(authcfg_id, temporary)
             except Exception:
-                path = ""
+                path = None
             if path:
                 paths.append(path)
-    except Exception:
-        pass
-    profile = QgsApplication.qgisSettingsDirPath() or ""
+    except Exception as err:
+        _logger.debug("QgsAuthOAuth2Config.tokenCachePath is unavailable: %s", err)
+    profile = QgsApplication.qgisSettingsDirPath() or None
     folders = [os.path.join(tempfile.gettempdir(), "oauth2-cache")]
     if profile:
         folders.insert(0, os.path.join(profile, "oauth2-cache"))
@@ -574,8 +580,10 @@ def _oauth2_token_cache_paths(authcfg_id):
 
 
 def _read_qgis_oauth_tokens(authcfg_id):
-    """Read access_token, refresh_token, expires, and id_token from the encrypted O2 cache file."""
-    result = {"refresh_token": "", "access_token": "", "expires_at": 0.0, "id_token": ""}
+    """Read access_token, refresh_token, expires, and id_token from the encrypted O2 cache file.
+
+    Return a token dict, or None if no cache file yielded tokens.
+    """
     client_id = OAUTH_CLIENT_ID
     group = "authcfg_%s" % authcfg_id
     for path in _oauth2_token_cache_paths(authcfg_id):
@@ -584,46 +592,43 @@ def _read_qgis_oauth_tokens(authcfg_id):
         settings = QSettings(path, _qt_ini_format())
         settings.beginGroup(group)
         try:
-            raw_refresh = settings.value("refreshtoken.%s" % client_id, "") or ""
-            raw_token = settings.value("token.%s" % client_id, "") or ""
-            raw_expires = settings.value("expires.%s" % client_id, "") or ""
-            raw_extra = settings.value("extratokens.%s" % client_id, "") or ""
+            raw_refresh = settings.value("refreshtoken.%s" % client_id)
+            raw_token = settings.value("token.%s" % client_id)
+            raw_expires = settings.value("expires.%s" % client_id)
+            raw_extra = settings.value("extratokens.%s" % client_id)
         finally:
             settings.endGroup()
-        refresh_token = _decrypt_o2_value(str(raw_refresh))
-        access_token = _decrypt_o2_value(str(raw_token))
-        expires_plain = _decrypt_o2_value(str(raw_expires)) or str(raw_expires)
-        extra_plain = _decrypt_o2_value(str(raw_extra)) or str(raw_extra)
+        refresh_token = _token_or_none(_decrypt_o2_value(raw_refresh))
+        access_token = _token_or_none(_decrypt_o2_value(raw_token))
+        expires_plain = _decrypt_o2_value(raw_expires) or raw_expires
+        extra_plain = _decrypt_o2_value(raw_extra) or raw_extra
         expires_at = 0.0
         try:
             expires_at = _normalize_expires_at(expires_plain or 0)
         except (TypeError, ValueError):
             expires_at = 0.0
-        id_token = ""
+        id_token = None
         if extra_plain:
             try:
                 extra = json.loads(extra_plain)
                 if isinstance(extra, dict):
-                    id_token = extra.get("id_token") or ""
+                    id_token = _token_or_none(extra.get("id_token"))
             except (TypeError, ValueError):
                 pass
         if refresh_token or access_token or expires_at:
-            result.update(
-                {
-                    "refresh_token": refresh_token,
-                    "access_token": access_token or result["access_token"],
-                    "expires_at": expires_at,
-                    "id_token": id_token,
-                }
-            )
             _logger.info(
                 "Read QGIS OAuth2 cache %s; refresh_token %s expires_at=%s",
                 path,
                 token_prefix(refresh_token),
                 int(expires_at) if expires_at else 0,
             )
-            break
-    return result
+            return {
+                "refresh_token": refresh_token,
+                "access_token": access_token,
+                "expires_at": expires_at,
+                "id_token": id_token,
+            }
+    return None
 
 
 def _remove_oauth_token_cache(authcfg_id):
@@ -751,15 +756,15 @@ def _stop_loopback_servers(servers, threads):
     for server in servers:
         try:
             server.shutdown()
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not shut down AUTHENIX redirect server: %s", err)
     for thread in threads:
         thread.join(2)
     for server in servers:
         try:
             server.server_close()
-        except Exception:
-            pass
+        except Exception as err:
+            _logger.debug("Could not close AUTHENIX redirect server: %s", err)
 
 
 def _exchange_authorization_code(code, verifier):
@@ -794,7 +799,7 @@ def _exchange_authorization_code(code, verifier):
         raise AuthError("AUTHENIX token response was not JSON.")
     if not isinstance(body, dict):
         raise AuthError("AUTHENIX token response was not JSON.")
-    access_token = (body.get("access_token") or "").strip()
+    access_token = _token_or_none(body.get("access_token"))
     if not access_token:
         raise AuthError("AUTHENIX did not return an access token. Sign in again.")
     expires_at = 0.0
@@ -805,8 +810,8 @@ def _exchange_authorization_code(code, verifier):
             expires_at = 0.0
     return {
         "access_token": access_token,
-        "id_token": (body.get("id_token") or "").strip(),
-        "refresh_token": (body.get("refresh_token") or "").strip(),
+        "id_token": _token_or_none(body.get("id_token")),
+        "refresh_token": _token_or_none(body.get("refresh_token")),
         "expires_at": expires_at,
     }
 
@@ -864,8 +869,8 @@ def _extract_tokens(authcfg_id):
     """Run authorization code + PKCE in the system browser; never call QGIS updateNetworkRequest."""
     extracted = _authorization_code_pkce()
     if extracted.get("access_token") and not _looks_like_id_token(extracted.get("id_token")):
-        cache = _read_qgis_oauth_tokens(authcfg_id)
-        extracted["id_token"] = cache.get("id_token") or extracted.get("id_token") or ""
+        cache = _read_qgis_oauth_tokens(authcfg_id) or {}
+        extracted["id_token"] = cache.get("id_token") or extracted.get("id_token")
     return extracted
 
 
@@ -887,7 +892,7 @@ def fetch_userinfo(access_token):
     return {}
 
 
-def _session_from_tokens(access_token, id_token="", refresh_token="", expires_at=0):
+def _session_from_tokens(access_token, id_token=None, refresh_token=None, expires_at=0):
     """Build the plugin session dict (tokens, expiry, user claims) stored in QgsSettings."""
     user = jwt_payload(id_token) or jwt_payload(access_token)
     extra = fetch_userinfo(access_token)
@@ -905,8 +910,8 @@ def _session_from_tokens(access_token, id_token="", refresh_token="", expires_at
     expires_in = max(0, int(expires_at - time.time())) if expires_at else 0
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token or "",
-        "id_token": id_token or "",
+        "refresh_token": _token_or_none(refresh_token),
+        "id_token": _token_or_none(id_token),
         "expires_at": expires_at,
         "expires_in": expires_in,
         "user": user,
@@ -919,13 +924,13 @@ def _session_from_extracted(extracted, previous=None):
     """Merge tokens from QGIS with the previous session so refresh_token / id_token are not dropped."""
     previous = dict(previous or {})
     session = _session_from_tokens(
-        extracted.get("access_token") or "",
-        extracted.get("id_token") or previous.get("id_token") or "",
-        extracted.get("refresh_token") or previous.get("refresh_token") or "",
+        extracted.get("access_token"),
+        extracted.get("id_token") or previous.get("id_token"),
+        extracted.get("refresh_token") or previous.get("refresh_token"),
         extracted.get("expires_at") or 0,
     )
     if not session.get("refresh_token"):
-        session["refresh_token"] = previous.get("refresh_token") or ""
+        session["refresh_token"] = previous.get("refresh_token")
     return session
 
 
@@ -972,9 +977,9 @@ def refresh_access_token(refresh_token=None):
     return session
 
 
-def logout_url(id_token=""):
+def logout_url(id_token=None):
     """AUTHENIX RP-logout URL. AUTHENIX requires id_token_hint."""
-    id_token = (id_token or "").strip()
+    id_token = _token_or_none(id_token)
     if not id_token:
         raise AuthError(
             "AUTHENIX logout requires id_token_hint. Sign in again so QGIS can keep the ID token."
@@ -989,31 +994,23 @@ def logout_url(id_token=""):
 
 def id_token_for_logout(session=None):
     """ID token from the stored session or the O2 cache; needed as id_token_hint on logout."""
-    session = dict(session or load_session())
-    id_token = (session.get("id_token") or "").strip()
+    session = dict(session or load_session() or {})
+    id_token = _token_or_none(session.get("id_token"))
     if _looks_like_id_token(id_token):
         return id_token
-    cache = _read_qgis_oauth_tokens(_stored_authcfg_id() or OAUTH_AUTHCFG_ID)
-    cached = (cache.get("id_token") or "").strip()
+    cache = _read_qgis_oauth_tokens(_stored_authcfg_id() or OAUTH_AUTHCFG_ID) or {}
+    cached = _token_or_none(cache.get("id_token"))
     return cached if _looks_like_id_token(cached) else cached
 
 
 def load_session():
-    """Restore tokens and user from QgsSettings, or empty if auth_backend is not this plugin's OAuth2."""
-    empty = {
-        "access_token": "",
-        "refresh_token": "",
-        "id_token": "",
-        "expires_at": 0.0,
-        "expires_in": 0,
-        "user": {},
-    }
+    """Restore tokens and user from QgsSettings, or None if auth_backend is not this plugin's OAuth2."""
     settings = QgsSettings()
     settings.beginGroup(SETTINGS_GROUP)
     try:
-        if (settings.value("auth_backend", "") or "") != AUTH_BACKEND:
-            return empty
-        user_raw = settings.value("user_json", "")
+        if (settings.value("auth_backend") or None) != AUTH_BACKEND:
+            return None
+        user_raw = settings.value("user_json")
         try:
             user = json.loads(user_raw) if user_raw else {}
         except (TypeError, json.JSONDecodeError):
@@ -1029,13 +1026,13 @@ def load_session():
         except (TypeError, ValueError):
             expires_in = max(0, int(expires_at - time.time())) if expires_at else 0
         return {
-            "access_token": settings.value("access_token", "") or "",
-            "refresh_token": settings.value("refresh_token", "") or "",
-            "id_token": settings.value("id_token", "") or "",
+            "access_token": _token_or_none(settings.value("access_token")),
+            "refresh_token": _token_or_none(settings.value("refresh_token")),
+            "id_token": _token_or_none(settings.value("id_token")),
             "expires_at": expires_at,
             "expires_in": expires_in,
             "user": user if isinstance(user, dict) else {},
-            "authcfg_id": settings.value("authcfg_id", "") or "",
+            "authcfg_id": _token_or_none(settings.value("authcfg_id")),
         }
     finally:
         settings.endGroup()
@@ -1047,14 +1044,20 @@ def save_session(session):
     settings.beginGroup(SETTINGS_GROUP)
     try:
         settings.setValue("auth_backend", AUTH_BACKEND)
-        settings.setValue("access_token", session.get("access_token") or "")
-        settings.setValue("refresh_token", session.get("refresh_token") or "")
-        settings.setValue("id_token", session.get("id_token") or "")
+        for key in ("access_token", "refresh_token", "id_token"):
+            value = _token_or_none(session.get(key))
+            if value:
+                settings.setValue(key, value)
+            else:
+                settings.remove(key)
         settings.setValue("expires_at", float(session.get("expires_at") or 0))
         settings.setValue("expires_in", int(session.get("expires_in") or 0))
         settings.setValue("user_json", json.dumps(session.get("user") or {}))
-        if session.get("authcfg_id"):
-            settings.setValue("authcfg_id", session.get("authcfg_id") or "")
+        authcfg_id = _token_or_none(session.get("authcfg_id"))
+        if authcfg_id:
+            settings.setValue("authcfg_id", authcfg_id)
+        else:
+            settings.remove("authcfg_id")
     finally:
         settings.endGroup()
 
@@ -1080,8 +1083,8 @@ def ensure_fresh_session(session=None, skew=None):
     """
     if skew is None:
         skew = TOKEN_REFRESH_SKEW
-    session = dict(session or load_session())
-    token = session.get("access_token") or ""
+    session = dict(session or load_session() or {})
+    token = session.get("access_token")
     expires_at = session.get("expires_at") or 0
     remaining = max(0, int(float(expires_at) - time.time())) if expires_at else 0
     if token_usable(token, expires_at, skew=skew):

@@ -251,16 +251,16 @@ def list_serial_ports():
     except Exception:
         return []
     for info in available:
-        device = ""
+        device = None
         if hasattr(info, "systemLocation"):
-            device = info.systemLocation() or ""
+            device = info.systemLocation() or None
         if not device and hasattr(info, "portName"):
-            device = info.portName() or ""
+            device = info.portName() or None
         if not device:
             continue
-        desc = ""
+        desc = None
         if hasattr(info, "description"):
-            desc = info.description() or ""
+            desc = info.description() or None
         label = "%s (%s)" % (device, desc) if desc else device
         ports.append((device, label))
     return _unique_serial_ports(ports)
@@ -318,8 +318,8 @@ class SerialWorker(QThread):
         finally:
             try:
                 sck.close()
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not close pyserial port %s: %s", self.port, err)
 
     def _run_qtserial(self):
         port_cls, _info, io_device = _qtserial_modules()
@@ -331,7 +331,7 @@ class SerialWorker(QThread):
         if mode is None:
             mode = io_device.ReadWrite
         if not port.open(mode):
-            err = ""
+            err = None
             if hasattr(port, "errorString"):
                 err = port.errorString()
             raise KitError("Could not open %s: %s" % (self.port, err or "unknown error"))
@@ -370,8 +370,8 @@ class SerialWorker(QThread):
         finally:
             try:
                 port.close()
-            except Exception:
-                pass
+            except Exception as err:
+                _logger.debug("Could not close QtSerialPort %s: %s", self.port, err)
 
     def _emit_loop(self, read_line):
         next_due = 0.0
