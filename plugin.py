@@ -91,11 +91,8 @@ _logger = logging.getLogger("sck.plugin")
 
 
 def _dock_area():
-    """Dock the panel on the right. Qt6 uses DockWidgetArea; older bindings used RightDockWidgetArea."""
-    try:
-        return Qt.DockWidgetArea.RightDockWidgetArea
-    except AttributeError:
-        return Qt.RightDockWidgetArea
+    """Dock the panel on the right."""
+    return Qt.DockWidgetArea.RightDockWidgetArea
 
 
 class SckDock(QDockWidget):
@@ -121,11 +118,7 @@ class SckDock(QDockWidget):
         self.publish_hint.setWordWrap(True)
         self.coord_label = QLabel()
         self.coord_label.setWordWrap(True)
-        try:
-            selectable = Qt.TextInteractionFlag.TextSelectableByMouse
-        except AttributeError:
-            selectable = Qt.TextSelectableByMouse
-        self.coord_label.setTextInteractionFlags(selectable)
+        self.coord_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText(DEFAULT_LOCATION_NAME)
         self.place_btn = QPushButton("Place marker on map")
@@ -152,25 +145,14 @@ class SckDock(QDockWidget):
         self.readings = QTableWidget(len(READING_ROWS), 2)
         self.readings.setHorizontalHeaderLabels(["Quantity", "Value"])
         self.readings.verticalHeader().setVisible(False)
-        try:
-            no_edit = QTableWidget.EditTrigger.NoEditTriggers
-        except AttributeError:
-            no_edit = QTableWidget.NoEditTriggers
-        self.readings.setEditTriggers(no_edit)
-        try:
-            self.readings.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        except AttributeError:
-            self.readings.setSelectionMode(QTableWidget.NoSelection)
+        self.readings.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.readings.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         for row, (_key, label) in enumerate(READING_ROWS):
             self.readings.setItem(row, 0, QTableWidgetItem(label))
             self.readings.setItem(row, 1, QTableWidgetItem("—"))
         header = self.readings.horizontalHeader()
-        try:
-            stretch = QHeaderView.ResizeMode.Stretch
-            contents = QHeaderView.ResizeMode.ResizeToContents
-        except AttributeError:
-            stretch = QHeaderView.Stretch
-            contents = QHeaderView.ResizeToContents
+        stretch = QHeaderView.ResizeMode.Stretch
+        contents = QHeaderView.ResizeMode.ResizeToContents
         header.setSectionResizeMode(0, contents)
         header.setSectionResizeMode(1, stretch)
         self.readings.setMaximumHeight(220)
@@ -688,11 +670,7 @@ class SckPlugin:
             or user.get("name")
         )
         dialog = PublishConsentDialog(licenses, default_name, self.iface.mainWindow())
-        try:
-            accepted = QDialog.DialogCode.Accepted
-        except AttributeError:
-            accepted = QDialog.Accepted
-        if dialog.exec() != accepted:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         choices = dialog.values()
         self._save_display_name(choices["display_name"])

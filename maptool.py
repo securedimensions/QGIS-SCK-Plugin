@@ -75,24 +75,15 @@ def map_point_to_pixel(canvas, map_point):
 
 
 def _icon_cross():
-    try:
-        return QgsVertexMarker.IconType.ICON_CROSS
-    except AttributeError:
-        return QgsVertexMarker.ICON_CROSS
+    return QgsVertexMarker.IconType.ICON_CROSS
 
 
 def _cross_cursor():
-    try:
-        return QCursor(Qt.CursorShape.CrossCursor)
-    except AttributeError:
-        return QCursor(Qt.CrossCursor)
+    return QCursor(Qt.CursorShape.CrossCursor)
 
 
 def _left_button():
-    try:
-        return Qt.MouseButton.LeftButton
-    except AttributeError:
-        return Qt.LeftButton
+    return Qt.MouseButton.LeftButton
 
 
 CURSOR_HINT_FOI = "Select FoI"
@@ -106,11 +97,7 @@ class CanvasCursorHint(QLabel):
         host = canvas.viewport() if hasattr(canvas, "viewport") else canvas
         super().__init__(host)
         self._host = host
-        try:
-            transparent = Qt.WidgetAttribute.WA_TransparentForMouseEvents
-        except AttributeError:
-            transparent = Qt.WA_TransparentForMouseEvents
-        self.setAttribute(transparent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setStyleSheet(
             "QLabel { background-color: rgba(32, 32, 32, 220); color: #fff; "
             "padding: 2px 8px; border-radius: 3px; font-size: 12px; }"

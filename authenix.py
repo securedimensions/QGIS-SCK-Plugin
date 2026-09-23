@@ -542,11 +542,8 @@ def _decrypt_o2_value(cipher_text):
 
 
 def _qt_ini_format():
-    """QSettings IniFormat enum (Qt6 name, with Qt5 fallback)."""
-    try:
-        return QSettings.Format.IniFormat
-    except AttributeError:
-        return QSettings.IniFormat
+    """QSettings IniFormat enum."""
+    return QSettings.Format.IniFormat
 
 
 def _oauth2_token_cache_paths(authcfg_id):

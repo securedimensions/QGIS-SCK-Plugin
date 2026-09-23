@@ -79,10 +79,7 @@ class PublishConsentDialog(QDialog):
         )
         consent_text.setWordWrap(True)
         consent_text.setBuddy(self.consent)
-        try:
-            align_top = Qt.AlignmentFlag.AlignTop
-        except AttributeError:
-            align_top = Qt.AlignTop
+        align_top = Qt.AlignmentFlag.AlignTop
         consent_row = QWidget()
         consent_layout = QHBoxLayout(consent_row)
         consent_layout.setContentsMargins(0, 0, 0, 0)
@@ -91,12 +88,8 @@ class PublishConsentDialog(QDialog):
         consent_text.mouseReleaseEvent = lambda _event: self.consent.toggle()
 
         self.buttons = QDialogButtonBox()
-        try:
-            accept_role = QDialogButtonBox.ButtonRole.AcceptRole
-            cancel = QDialogButtonBox.StandardButton.Cancel
-        except AttributeError:
-            accept_role = QDialogButtonBox.AcceptRole
-            cancel = QDialogButtonBox.Cancel
+        accept_role = QDialogButtonBox.ButtonRole.AcceptRole
+        cancel = QDialogButtonBox.StandardButton.Cancel
         self.ok_btn = self.buttons.addButton("Start publishing", accept_role)
         self.buttons.addButton(cancel)
         self.ok_btn.setEnabled(False)

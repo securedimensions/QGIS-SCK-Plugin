@@ -89,10 +89,7 @@ def _qgs_geometry(geom_dict):
 
 
 def _left_button():
-    try:
-        return Qt.MouseButton.LeftButton
-    except AttributeError:
-        return Qt.LeftButton
+    return Qt.MouseButton.LeftButton
 
 
 def _style_layer(layer, kind):
@@ -477,16 +474,10 @@ class PlacesClickFilter(QObject):
     def eventFilter(self, obj, event):
         if obj is not self._host:
             return False
-        try:
-            press_type = QEvent.Type.MouseButtonPress
-            release_type = QEvent.Type.MouseButtonRelease
-            move_type = QEvent.Type.MouseMove
-            leave_type = QEvent.Type.Leave
-        except AttributeError:
-            press_type = QEvent.MouseButtonPress
-            release_type = QEvent.MouseButtonRelease
-            move_type = QEvent.MouseMove
-            leave_type = QEvent.Leave
+        press_type = QEvent.Type.MouseButtonPress
+        release_type = QEvent.Type.MouseButtonRelease
+        move_type = QEvent.Type.MouseMove
+        leave_type = QEvent.Type.Leave
         etype = event.type()
         if etype == move_type:
             if self.hint is not None:

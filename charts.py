@@ -81,20 +81,12 @@ def _fmt_time(ts):
 
 
 def _qt_align():
-    try:
-        return (
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-        )
-    except AttributeError:
-        return (
-            Qt.AlignRight | Qt.AlignTop,
-            Qt.AlignRight | Qt.AlignBottom,
-            Qt.AlignLeft | Qt.AlignVCenter,
-            Qt.AlignRight | Qt.AlignVCenter,
-        )
+    return (
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+    )
 
 
 class PlotCanvas(QWidget):
@@ -105,10 +97,7 @@ class PlotCanvas(QWidget):
         self._color = _qcolor(color)
         self._points = []
         self.setFixedHeight(48)
-        try:
-            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        except AttributeError:
-            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_points(self, points):
         self._points = list(points or [])
@@ -116,10 +105,7 @@ class PlotCanvas(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        except AttributeError:
-            painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         width = max(1, self.width())
         height = max(1, self.height())
         pad_l, pad_r, pad_t, pad_b = 1, 3, 3, 3
@@ -156,10 +142,7 @@ class PlotCanvas(QWidget):
                 path.lineTo(x, y)
         pen = QPen(self._color)
         pen.setWidthF(1.6)
-        try:
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        except AttributeError:
-            pen.setJoinStyle(Qt.RoundJoin)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         painter.drawPath(path)
         last_x, last_y = xy(pts[-1][0], pts[-1][1])
@@ -295,7 +278,7 @@ class MarkerChartOverlay(QFrame):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
-        scroll.setFrameShape(QFrame.Shape.NoFrame if hasattr(QFrame, "Shape") else QFrame.NoFrame)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setMinimumHeight(280)
         scroll.setMaximumHeight(420)
 
@@ -305,10 +288,7 @@ class MarkerChartOverlay(QFrame):
         layout.addWidget(self.empty)
         layout.addWidget(scroll)
         self.setFixedWidth(380)
-        try:
-            self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        except AttributeError:
-            self.setFocusPolicy(Qt.NoFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.hide()
         self._connect_canvas()
 
