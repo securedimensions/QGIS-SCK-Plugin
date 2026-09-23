@@ -1013,22 +1013,35 @@ class SckPlugin:
         log_error("SCK serial error:\n%s" % error)
 
     def on_serial_finished(self):
-        """Worker thread ended (disconnect, failure, or missing backend)."""
+        """Worker thread ended (unplug, user disconnect, failure, or missing backend)."""
+        worker = self.serial_worker
+        link_lost = bool(worker is not None and getattr(worker, "link_lost", False))
         self.kit_connected = False
         self.serial_stopping = False
         self.serial_worker = None
         self._reset_kit_charts()
         if self.publishing:
             self.stop_publishing(quiet=True)
-            self._note("Kit disconnected; publishing stopped.")
+            self._note(
+                "Kit unplugged; publishing stopped."
+                if link_lost
+                else "Kit disconnected; publishing stopped."
+            )
+        elif link_lost:
+            self._note("Smart Citizen Kit unplugged. Readings stopped.")
         if self.dock is not None:
             text = self.dock.serial_status.text() or ""
-            if "fail" not in text.lower():
+            if link_lost:
+                self.dock.serial_status.setText("Kit disconnected")
+            elif "fail" not in text.lower():
                 self.dock.serial_status.setText("Kit not connected")
             self.dock.refresh()
 
     def on_kit_sample(self, sample):
         """Update the dock table and charts; publish an ObservationGroup when publishing."""
+        worker = self.serial_worker
+        if worker is not None and getattr(worker, "link_lost", False):
+            return
         if not self.kit_connected or not isinstance(sample, dict):
             return
         values = sample

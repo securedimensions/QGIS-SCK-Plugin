@@ -15,7 +15,10 @@
 
 """Smart Citizen Kit serial connection and monitor-line parsing."""
 
+import errno
 import logging
+import math
+import os
 import re
 import time
 import traceback
@@ -36,6 +39,15 @@ SCK_MONITOR_CMD = (
 _MAC_RE = re.compile(
     r"(?i)(?:sta\s+)?mac(?:\s*address)?\s*:\s*([0-9a-f]{2}(?::[0-9a-f]{2}){5})"
 )
+_NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_LINK_LOST_ERRNOS = frozenset({
+    errno.EIO,
+    errno.ENXIO,
+    errno.ENODEV,
+    errno.EBADF,
+    errno.EPIPE,
+    errno.ENOENT,
+})
 
 READING_ROWS = [
     ("phenomenon_time", "Time"),
@@ -133,6 +145,16 @@ def query_kit_mac(write, read_line, should_stop):
     return _read_mac_until(read_line, 4.0, should_stop)
 
 
+def _reading_value(token):
+    """Float for one monitor field, or ValueError when the token is not a finite number."""
+    if not _NUMBER_RE.match(token):
+        raise ValueError(token)
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(token)
+    return value
+
+
 def parse_sck_line(data):
     """Parse one SCK monitor line into a sample dict, or None if it is not a reading."""
     if data is None:
@@ -146,16 +168,30 @@ def parse_sck_line(data):
     if len(obs) != 9:
         return None
     stamp, temp, humidity, light, noise, pressure, pm1, pm25, pm10 = obs
+    try:
+        values = [
+            _reading_value(temp),
+            _reading_value(humidity),
+            _reading_value(light),
+            _reading_value(noise),
+            _reading_value(pressure),
+            _reading_value(pm1),
+            _reading_value(pm25),
+            _reading_value(pm10),
+        ]
+    except ValueError:
+        return None
+    temperature, humidity, light, noise, pressure, pm1, pm25, pm10 = values
     return {
         "phenomenon_time": _phenomenon_time(stamp),
-        "temperature": float(temp),
-        "humidity": float(humidity),
-        "light": float(light),
-        "noise": float(noise),
-        "pressure": float(pressure),
-        "pm1": float(pm1),
-        "pm25": float(pm25),
-        "pm10": float(pm10),
+        "temperature": temperature,
+        "humidity": humidity,
+        "light": light,
+        "noise": noise,
+        "pressure": pressure,
+        "pm1": pm1,
+        "pm25": pm25,
+        "pm10": pm10,
         "raw": data,
     }
 
@@ -232,6 +268,114 @@ def _unique_serial_ports(ports):
     return unique
 
 
+def _is_link_lost(err):
+    """True when a serial read failed because the USB device is gone."""
+    seen = set()
+    current = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and getattr(current, "errno", None) in _LINK_LOST_ERRNOS:
+            return True
+        text = str(current).lower()
+        if (
+            "disconnected" in text
+            or "device not configured" in text
+            or "no such file" in text
+            or "device not found" in text
+            or "resourceerror" in text
+            or "resource error" in text
+        ):
+            return True
+        current = getattr(current, "__cause__", None)
+    return False
+
+
+def _device_path(port):
+    """Filesystem path for a macOS/Linux serial node, or None for COM ports."""
+    text = str(port or "").strip()
+    if not text or text.upper().startswith("COM"):
+        return None
+    if text.startswith("/dev/"):
+        return text
+    if text.startswith("cu.") or text.startswith("tty."):
+        return "/dev/" + text
+    if os.name != "nt" and text.startswith("/"):
+        return text
+    return None
+
+
+def _port_listed(port):
+    """True when port is still enumerated. Enumeration failure keeps the link up."""
+    try:
+        devices = {device for device, _label in list_serial_ports()}
+    except Exception as err:
+        _logger.debug("Could not list serial ports while watching %s: %s", port, err)
+        return True
+    return port in devices
+
+
+class _PortWatch:
+    """Notice when the USB serial device node disappears after the cable is unplugged."""
+
+    def __init__(self, port):
+        self.port = port
+        self._listed_ok = True
+        self._listed_at = 0.0
+
+    def present(self, force=False):
+        path = _device_path(self.port)
+        if path is not None:
+            return os.path.exists(path)
+        now = time.time()
+        if not force and now - self._listed_at < 0.5:
+            return self._listed_ok
+        self._listed_ok = _port_listed(self.port)
+        self._listed_at = now
+        return self._listed_ok
+
+
+def _binary_noise(line):
+    """True when a chunk is mostly non-text, as a floating USB line produces after unplug."""
+    if line is None:
+        return False
+    raw = line if isinstance(line, bytes) else str(line).encode("utf-8", errors="replace")
+    stripped = raw.strip(b"\r\n")
+    if not stripped:
+        return False
+    weird = sum(1 for byte in stripped if byte not in (9, 13) and not 32 <= byte < 127)
+    return weird * 4 >= len(stripped)
+
+
+def _qtserial_removed(port):
+    """True when Qt reports the USB serial device was removed.
+
+    Match the error name. Qt 6 renumbered SerialPortError, and TimeoutError is 9
+    there — the same integer as Qt 5 ResourceError — so a bare integer 9 must not
+    count as unplug (it is the normal waitForReadyRead timeout).
+    """
+    try:
+        err = port.error()
+    except Exception as exc:
+        _logger.debug("Could not read QSerialPort error: %s", exc)
+        return False
+    name = getattr(err, "name", None) or ""
+    if name in ("ResourceError", "DeviceNotFoundError"):
+        return True
+    if name:
+        return False
+    text = str(err)
+    if "ResourceError" in text or "DeviceNotFoundError" in text:
+        return True
+    if "Timeout" in text or "NoError" in text:
+        return False
+    try:
+        code = int(err)
+    except (TypeError, ValueError):
+        return False
+    # Plain ints from Qt 6: DeviceNotFoundError=1, ResourceError=6.
+    return code in (1, 6)
+
+
 def list_serial_ports():
     """Return [(device, label), ...] for USB serial ports."""
     ports = []
@@ -278,9 +422,17 @@ class SerialWorker(QThread):
         super().__init__(parent)
         self.port = port
         self._stop = False
+        self.link_lost = False
 
     def stop(self):
         self._stop = True
+
+    def _mark_link_lost(self, reason):
+        """Stop after the USB cable is unplugged. A user Disconnect wins over this."""
+        if self._stop:
+            return
+        self.link_lost = True
+        _logger.info("SCK serial link lost on %s: %s", self.port, reason)
 
     def run(self):
         backend = serial_backend()
@@ -295,14 +447,20 @@ class SerialWorker(QThread):
                 )
         except KitError as err:
             self.failed.emit(str(err))
-        except Exception:
-            self.failed.emit(traceback.format_exc())
+        except Exception as err:
+            if _is_link_lost(err):
+                self._mark_link_lost(err)
+            elif not self._stop:
+                self.failed.emit(traceback.format_exc())
         finally:
             self.finished_ok.emit()
 
     def _run_pyserial(self):
         serial_cls, _ports = _pyserial_module()
-        sck = serial_cls(self.port, SCK_BAUD, timeout=1)
+        try:
+            sck = serial_cls(self.port, SCK_BAUD, timeout=1)
+        except Exception as err:
+            raise KitError("Could not open %s: %s" % (self.port, err)) from err
         try:
             mac = query_kit_mac(sck.write, lambda: sck.readline(), lambda: self._stop)
             if self._stop:
@@ -314,7 +472,21 @@ class SerialWorker(QThread):
                 self.port,
                 mac or "(none)",
             )
-            self._emit_loop(lambda: sck.readline())
+
+            port_watch = _PortWatch(self.port)
+
+            def link_ok(force=False):
+                if not port_watch.present(force=force):
+                    return False
+                try:
+                    _ = sck.in_waiting
+                except Exception as err:
+                    if _is_link_lost(err):
+                        return False
+                    _logger.debug("Could not query in_waiting on %s: %s", self.port, err)
+                return True
+
+            self._emit_loop(lambda: sck.readline(), link_ok)
         finally:
             try:
                 sck.close()
@@ -340,12 +512,21 @@ class SerialWorker(QThread):
 
             def read_line():
                 nonlocal buf
-                if port.waitForReadyRead(200):
+                if _qtserial_removed(port):
+                    buf = b""
+                    raise OSError(errno.EIO, "serial device removed")
+                if port.waitForReadyRead(200) and not _qtserial_removed(port):
                     chunk = port.readAll()
+                    if _qtserial_removed(port):
+                        buf = b""
+                        raise OSError(errno.EIO, "serial device removed")
                     if hasattr(chunk, "data"):
                         buf += bytes(chunk.data())
                     else:
                         buf += bytes(chunk)
+                elif _qtserial_removed(port):
+                    buf = b""
+                    raise OSError(errno.EIO, "serial device removed")
                 if b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     return line
@@ -366,24 +547,74 @@ class SerialWorker(QThread):
                 self.port,
                 mac or "(none)",
             )
-            self._emit_loop(read_line)
+            port_watch = _PortWatch(self.port)
+
+            def link_ok(force=False):
+                if _qtserial_removed(port):
+                    return False
+                return port_watch.present(force=force)
+
+            self._emit_loop(read_line, link_ok)
         finally:
             try:
                 port.close()
             except Exception as err:
                 _logger.debug("Could not close QtSerialPort %s: %s", self.port, err)
 
-    def _emit_loop(self, read_line):
+    def _link_ok_now(self, link_ok, force=False):
+        try:
+            return bool(link_ok(force=force))
+        except Exception as err:
+            if _is_link_lost(err):
+                return False
+            raise
+
+    def _link_still_up(self, link_ok):
+        """False when the USB device is gone. A second check ignores a one-off enumeration glitch."""
+        if self._link_ok_now(link_ok):
+            return True
+        self.msleep(250)
+        if self._stop:
+            return False
+        return self._link_ok_now(link_ok, force=True)
+
+    def _emit_loop(self, read_line, link_ok):
         next_due = 0.0
         latest = None
+        noise_hits = 0
         while not self._stop:
-            line = read_line()
+            try:
+                line = read_line()
+            except Exception as err:
+                if self._stop:
+                    return
+                if _is_link_lost(err):
+                    self._mark_link_lost(err)
+                    return
+                raise
+            if self._stop:
+                return
+            if not self._link_still_up(link_ok):
+                if not self._stop:
+                    self._mark_link_lost("USB serial device removed")
+                return
+            if line and _binary_noise(line):
+                noise_hits += 1
+                if noise_hits >= 3:
+                    self._mark_link_lost("serial noise after unplug")
+                    return
+                continue
+            noise_hits = 0
             if line:
                 parsed = parse_sck_line(line)
                 if parsed is not None:
                     latest = parsed
             now = time.time()
             if latest is not None and now >= next_due:
+                if not self._link_still_up(link_ok):
+                    if not self._stop:
+                        self._mark_link_lost("USB serial device removed")
+                    return
                 self.sample.emit(latest)
                 latest = None
                 next_due = now + SCK_SAMPLE_INTERVAL
