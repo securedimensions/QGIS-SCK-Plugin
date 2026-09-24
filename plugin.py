@@ -65,6 +65,8 @@ from .config import (
     STA_URL,
     CHART_WINDOW_S,
     DISPLAY_NAME_KEY,
+    MQTT_RECONNECT_BACKOFF,
+    MQTT_RECONNECT_TIMEOUT,
 )
 from .locate import DeviceLocator
 from .log import install_python_logging, log_error, log_info, log_success, log_warning
@@ -81,7 +83,7 @@ from .maptool import (
 )
 from .charts import MarkerChartOverlay
 from .kit import READING_ROWS, SerialWorker, list_serial_ports, sample_chart_point, serial_backend
-from .mqtt import MqttError, MqttPublisher
+from .mqtt import MqttConnectionError, MqttError, MqttPublisher, MqttUnauthorized
 from .publish import SetupWorker, apply_sample, observation_group_payload
 from .publish_dialog import PublishConsentDialog
 from .places import PlacesClickFilter, PlacesLayerStore, PlacesWorker
@@ -240,7 +242,7 @@ class SckDock(QDockWidget):
             )
         else:
             self.status.setText("Not signed in. Sign in with AUTHENIX (QGIS OAuth2).")
-        self.sign_in_btn.setEnabled(not usable)
+        self.sign_in_btn.setEnabled(not usable or self.plugin.mqtt_needs_sign_in())
         self.sign_out_btn.setEnabled(signed_in)
         ready = (
             signed_in
@@ -256,6 +258,8 @@ class SckDock(QDockWidget):
         self.stop_btn.setEnabled(self.plugin.publishing)
         if self.plugin.publishing and self.plugin.setup_busy():
             self.publish_hint.setText("Updating Location and PartyLocation for the marker.")
+        elif self.plugin.publishing and self.plugin.mqtt_needs_sign_in():
+            self.publish_hint.setText("Publishing paused. Sign in to resume.")
         elif self.plugin.publishing:
             self.publish_hint.setText("Publishing ObservationGroups to STAplus.")
         elif not signed_in:
@@ -427,6 +431,7 @@ class SckPlugin:
         self.publishing = False
         self.publish_config = None
         self.mqtt_publisher = None
+        self._clear_mqtt_backoff()
         self.setup_worker = None
         self._chart_history = []
         self._open_charts_on_sample = False
@@ -602,6 +607,7 @@ class SckPlugin:
         name = user.get("preferred_username") or user.get("sub") or "AUTHENIX user"
         log_success("Signed in as %s" % name)
         self._note("Signed in as %s" % name, Qgis.MessageLevel.Success)
+        self._resume_mqtt_after_sign_in()
         if self.dock is not None:
             self.dock.refresh()
 
@@ -757,6 +763,7 @@ class SckPlugin:
             return
         self.mqtt_publisher = publisher
         self.publishing = True
+        self._clear_mqtt_backoff()
         if self.dock is not None:
             self.dock.append_log(pretty)
             self.dock.refresh()
@@ -794,6 +801,7 @@ class SckPlugin:
         self.publish_config = None
         publisher = self.mqtt_publisher
         self.mqtt_publisher = None
+        self._clear_mqtt_backoff()
         if publisher is not None:
             try:
                 publisher.disconnect()
@@ -1026,6 +1034,10 @@ class SckPlugin:
         if self.publishing and self.publish_config is not None:
             try:
                 values = self._publish_sample(sample)
+            except authenix.AuthError as err:
+                self._note_mqtt_auth(err)
+            except MqttConnectionError as err:
+                self._note_mqtt_down(err)
             except Exception as err:
                 self._note("Publish failed: %s" % err, Qgis.MessageLevel.Warning)
                 log_error(traceback.format_exc())
@@ -1044,13 +1056,147 @@ class SckPlugin:
             self.chart_overlay.set_anchor(self.lat, self.lon)
             self.chart_overlay.show_at_marker()
 
+    def _clear_mqtt_backoff(self):
+        """Forget reconnect delay after a clean connect or a user stop."""
+        self._mqtt_retry_after = 0.0
+        self._mqtt_down_noted = False
+        self._mqtt_just_connected = False
+        self._mqtt_rejected_token = None
+        self._mqtt_auth_noted = False
+
+    def mqtt_needs_sign_in(self):
+        """True when publishing is waiting for a new AUTHENIX access token."""
+        return self._mqtt_rejected_token is not None
+
+    def _note_mqtt_down(self, err):
+        """Warn once while the broker session is down so each kit sample does not toast."""
+        if self._mqtt_down_noted:
+            _logger.debug("MQTT still disconnected: %s", err)
+            return
+        self._mqtt_down_noted = True
+        self._note(
+            "MQTT disconnected (%s). Publishing resumes when the network is back." % err,
+            Qgis.MessageLevel.Warning,
+        )
+
+    def _note_mqtt_auth(self, err):
+        """Warn once. This public client cannot refresh an access token in the background."""
+        if self._mqtt_auth_noted:
+            _logger.debug("MQTT still waiting for sign-in: %s", err)
+            return
+        self._mqtt_auth_noted = True
+        self._note(str(err), Qgis.MessageLevel.Warning)
+        if self.dock is not None:
+            self.dock.refresh()
+
+    def _require_mqtt_token(self):
+        """Return a usable access token, or raise AuthError without contacting the broker."""
+        session = authenix.load_session() or {}
+        token = session.get("access_token") or ""
+        if not authenix.token_usable(token, session.get("expires_at")):
+            self._mqtt_rejected_token = token
+            if not token:
+                raise authenix.AuthError(
+                    "Not signed in. Click Sign in. Publishing resumes after you sign in."
+                )
+            raise authenix.AuthError(
+                "The AUTHENIX access token has expired. Click Sign in. "
+                "Publishing resumes after you sign in."
+            )
+        if self._mqtt_rejected_token is not None and token == self._mqtt_rejected_token:
+            raise authenix.AuthError(
+                "MQTT rejected this access token. Click Sign in. "
+                "Publishing resumes after you sign in."
+            )
+        return token
+
+    def _resume_mqtt_after_sign_in(self):
+        """Open the MQTT session with the token just stored by Sign in."""
+        if not self.publishing or self.publish_config is None:
+            return
+        if self._mqtt_rejected_token is None and not self._mqtt_auth_noted:
+            return
+        self._mqtt_rejected_token = None
+        self._mqtt_auth_noted = False
+        self._mqtt_retry_after = 0.0
+        try:
+            self._ensure_mqtt_connected(force=True)
+        except MqttConnectionError as err:
+            self._note_mqtt_down(err)
+        except authenix.AuthError as err:
+            self._note_mqtt_auth(err)
+        except MqttError as err:
+            self._note("MQTT connect failed: %s" % err, Qgis.MessageLevel.Warning)
+        else:
+            self._mqtt_just_connected = False
+            self._note("MQTT reconnected. Publishing resumed.", Qgis.MessageLevel.Success)
+        if self.dock is not None:
+            self.dock.refresh()
+
+    def _ensure_mqtt_connected(self, force=False):
+        """Open the MQTT session again after Wi-Fi or the broker drops the TCP connection.
+
+        An expired access token is not sent to the broker. AUTHENIX is a public client,
+        so the user must click Sign in. The next sample reconnects with that new token.
+        """
+        publisher = self.mqtt_publisher
+        if publisher is not None and not force and publisher.is_connected():
+            return
+        token = self._require_mqtt_token()
+        now = time.time()
+        if not force and now < self._mqtt_retry_after:
+            raise MqttConnectionError("MQTT publisher is not connected")
+        cfg = self.publish_config or {}
+        host = cfg.get("mqtt_host")
+        port = cfg.get("mqtt_port")
+        if not host or not port:
+            raise MqttError("MQTT host and port are missing. Start publishing again.")
+        if publisher is None:
+            publisher = MqttPublisher(host, port)
+            self.mqtt_publisher = publisher
+        _logger.info("Reconnecting MQTT publisher at %s:%s", host, port)
+        try:
+            publisher.connect(token, timeout=MQTT_RECONNECT_TIMEOUT)
+        except MqttUnauthorized as err:
+            _logger.warning("MQTT reconnect unauthorized: %s", err)
+            self._mqtt_rejected_token = token
+            raise authenix.AuthError(
+                "MQTT rejected the access token. Click Sign in. "
+                "Publishing resumes after you sign in."
+            ) from err
+        except MqttError:
+            self._mqtt_retry_after = time.time() + MQTT_RECONNECT_BACKOFF
+            raise
+        self._mqtt_retry_after = 0.0
+        self._mqtt_rejected_token = None
+        self._mqtt_just_connected = True
+
     def _publish_sample(self, sample):
-        """Normalize the sample, PUBLISH one ObservationGroup, return values for the table."""
+        """Normalize the sample, PUBLISH one ObservationGroup, return values for the table.
+
+        A dropped Wi-Fi link clears the TCP socket. Reconnect and publish this sample
+        again instead of leaving the publisher disconnected.
+        """
         values = apply_sample(self.publish_config, sample)
         payload = json.dumps(observation_group_payload(self.publish_config, values))
-        if self.mqtt_publisher is None or not self.mqtt_publisher.is_connected():
-            raise MqttError("MQTT publisher is not connected")
-        self.mqtt_publisher.publish(payload)
+        self._ensure_mqtt_connected()
+        try:
+            self.mqtt_publisher.publish(payload)
+        except MqttConnectionError as err:
+            _logger.info("MQTT publish lost the session (%s); reconnecting", err)
+            self._ensure_mqtt_connected(force=True)
+            self.mqtt_publisher.publish(payload)
+        if self._mqtt_just_connected:
+            self._mqtt_just_connected = False
+            resume_note = self._mqtt_down_noted or self._mqtt_auth_noted
+            self._mqtt_down_noted = False
+            self._mqtt_auth_noted = False
+            if resume_note:
+                self._note("MQTT reconnected. Publishing resumed.", Qgis.MessageLevel.Success)
+                if self.dock is not None:
+                    self.dock.refresh()
+            else:
+                log_info("MQTT session restored after a dropped connection.")
         log_info(
             "MQTT PUBACK for ObservationGroup at %s (sck_id %s)"
             % (values.get("phenomenon_time"), self.publish_config.get("sck_id"))

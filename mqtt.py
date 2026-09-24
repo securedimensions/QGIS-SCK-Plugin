@@ -83,6 +83,14 @@ class MqttError(RuntimeError):
     """Raised when CONNECT, PUBLISH, or broker acknowledgement fails."""
 
 
+class MqttConnectionError(MqttError):
+    """The TCP session is gone. Open a new CONNECT before publishing again."""
+
+
+class MqttUnauthorized(MqttError):
+    """Broker rejected the access token on CONNECT."""
+
+
 def _encode_remaining_length(length):
     """MQTT remaining-length encoding (variable-length integer)."""
     output = bytearray()
@@ -259,7 +267,7 @@ def _read_exact(sock, size):
     while remaining:
         chunk = sock.recv(remaining)
         if not chunk:
-            raise MqttError("MQTT broker closed the connection")
+            raise MqttConnectionError("MQTT broker closed the connection")
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
@@ -348,6 +356,32 @@ def _read_connack(sock):
     return reason, props
 
 
+def _enable_tcp_keepalive(sock, idle=15):
+    """Ask the OS to probe a quiet socket so a dropped Wi-Fi path does not stay half-open."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError as err:
+        _logger.debug("Could not enable TCP keepalive: %s", err)
+        return
+    for opt in (getattr(socket, "TCP_KEEPALIVE", None), getattr(socket, "TCP_KEEPIDLE", None)):
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, idle)
+        except OSError as err:
+            _logger.debug("Could not set TCP keepalive idle: %s", err)
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        except OSError as err:
+            _logger.debug("Could not set TCP keepalive interval: %s", err)
+    if hasattr(socket, "TCP_KEEPCNT"):
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except OSError as err:
+            _logger.debug("Could not set TCP keepalive count: %s", err)
+
+
 def _open_mqtt(host, port, token, timeout=15, keep_alive=MQTT_KEEP_ALIVE):
     """CONNECT and return (sock, connack_reason). sock is None when CONNACK is not 0."""
     client_id = "qgis-sck-%s" % int(time.time())
@@ -355,6 +389,7 @@ def _open_mqtt(host, port, token, timeout=15, keep_alive=MQTT_KEEP_ALIVE):
     _logger.info("MQTT CONNECT %s:%s client_id=%s username=Bearer protocol=5", host, port, client_id)
     sock = socket.create_connection((host, port), timeout=timeout)
     try:
+        _enable_tcp_keepalive(sock)
         sock.settimeout(timeout)
         sock.sendall(packet)
         return_code, _props = _read_connack(sock)
@@ -396,7 +431,51 @@ class MqttPublisher:
         self._packet_id = 0
 
     def is_connected(self):
-        return self.sock is not None
+        """True when the TCP socket can still carry MQTT. Drops a dead socket."""
+        if not self._transport_open():
+            if self.sock is not None:
+                _logger.info("MQTT transport closed; dropping the session")
+                self.disconnect()
+            return False
+        return True
+
+    def _transport_open(self):
+        """Peek the socket. A Wi-Fi drop leaves the fd open until the next read or write."""
+        sock = self.sock
+        if sock is None:
+            return False
+        previous = None
+        changed = False
+        try:
+            if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
+                return False
+            previous = sock.gettimeout()
+            sock.settimeout(0.0)
+            changed = True
+            peeked = sock.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            return True
+        except InterruptedError:
+            return True
+        except OSError:
+            return False
+        else:
+            return peeked != b""
+        finally:
+            if changed:
+                try:
+                    sock.settimeout(previous)
+                except OSError:
+                    pass
+
+    def _io_timeout(self, seconds):
+        if self.sock is None:
+            raise MqttConnectionError("MQTT publisher is not connected")
+        try:
+            self.sock.settimeout(seconds)
+        except OSError as err:
+            self.disconnect()
+            raise MqttConnectionError("MQTT connection lost: %s" % err) from err
 
     def _next_packet_id(self):
         self._packet_id += 1
@@ -404,12 +483,19 @@ class MqttPublisher:
             self._packet_id = 1
         return self._packet_id
 
-    def connect(self, token):
+    def connect(self, token, timeout=15):
         self.disconnect()
-        sock, return_code = _open_mqtt(self.host, self.port, token, keep_alive=self.keep_alive)
+        try:
+            sock, return_code = _open_mqtt(
+                self.host, self.port, token, timeout=timeout, keep_alive=self.keep_alive
+            )
+        except MqttConnectionError:
+            raise
+        except OSError as err:
+            raise MqttConnectionError("MQTT connect failed: %s" % err) from err
         unauthorized = return_code in MQTT_UNAUTHORIZED or return_code == MQTT5_NOT_AUTHORIZED
         if unauthorized:
-            raise MqttError("MQTT CONNECT unauthorized (%s)" % _reason_text(return_code))
+            raise MqttUnauthorized("MQTT CONNECT unauthorized (%s)" % _reason_text(return_code))
         if return_code != 0 or sock is None:
             raise MqttError("MQTT CONNECT failed (%s)" % _reason_text(return_code))
         self.sock = sock
@@ -423,6 +509,8 @@ class MqttPublisher:
         if sock is None:
             return
         try:
+            # A dead route can block in send until the old timeout. Cap it.
+            sock.settimeout(0.5)
             sock.sendall(bytes([0xE0, 0x00]))
         except Exception as err:
             _logger.debug("Could not send MQTT DISCONNECT: %s", err)
@@ -432,8 +520,9 @@ class MqttPublisher:
             pass
 
     def publish(self, payload, topic=MQTT_PUBLISH_TOPIC, qos=MQTT_PUBLISH_QOS):
-        if self.sock is None:
-            raise MqttError("MQTT publisher is not connected")
+        if not self.is_connected():
+            raise MqttConnectionError("MQTT publisher is not connected")
+        self._io_timeout(MQTT_PUBLISH_TIMEOUT)
         self._maybe_ping()
         qos = int(qos)
         packet_id = self._next_packet_id() if qos > 0 else 0
@@ -442,10 +531,11 @@ class MqttPublisher:
             self.sock.sendall(packet)
         except OSError as err:
             self.disconnect()
-            raise MqttError("MQTT publish failed: %s" % err) from err
+            raise MqttConnectionError("MQTT publish failed: %s" % err) from err
         self._last_activity = time.time()
         if qos < 1:
             _logger.debug("MQTT published qos=0 topic=%s bytes=%s", topic, len(packet))
+            self._io_timeout(MQTT_PUBLISH_TIMEOUT)
             return packet_id
         return self._await_puback(packet_id, topic)
 
@@ -456,7 +546,8 @@ class MqttPublisher:
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise MqttError(
+                self.disconnect()
+                raise MqttConnectionError(
                     "MQTT PUBACK timed out mid=%s qos=1 topic=%s after %ss"
                     % (packet_id, topic, timeout)
                 )
@@ -464,13 +555,16 @@ class MqttPublisher:
                 self.sock.settimeout(remaining)
                 packet_type, flags, payload = _read_packet(self.sock)
             except socket.timeout as err:
-                raise MqttError(
+                self.disconnect()
+                raise MqttConnectionError(
                     "MQTT PUBACK timed out mid=%s qos=1 topic=%s after %ss"
                     % (packet_id, topic, timeout)
                 ) from err
             except (OSError, MqttError) as err:
                 self.disconnect()
-                raise MqttError("MQTT PUBACK wait failed mid=%s: %s" % (packet_id, err)) from err
+                raise MqttConnectionError(
+                    "MQTT PUBACK wait failed mid=%s: %s" % (packet_id, err)
+                ) from err
 
             if packet_type == PKT_PINGRESP:
                 continue
@@ -479,7 +573,7 @@ class MqttPublisher:
                 text = _reason_text(reason, props)
                 self.disconnect()
                 _logger.error("MQTT DISCONNECT during PUBACK wait mid=%s %s", packet_id, text)
-                raise MqttError("MQTT disconnected: %s" % text)
+                raise MqttConnectionError("MQTT disconnected: %s" % text)
             if packet_type == PKT_PUBLISH:
                 pub_topic, _mid, body, props = _parse_publish(flags, payload)
                 text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
@@ -519,6 +613,7 @@ class MqttPublisher:
                 _logger.error("MQTT broker error after PUBACK mid=%s: %s", packet_id, detail)
                 raise MqttError("MQTT broker error: %s" % detail)
             _logger.info("MQTT PUBACK mid=%s %s topic=%s", packet_id, text, topic)
+            self._io_timeout(MQTT_PUBLISH_TIMEOUT)
             return packet_id
 
     def _maybe_ping(self):
@@ -531,7 +626,7 @@ class MqttPublisher:
             self._last_activity = time.time()
         except OSError as err:
             self.disconnect()
-            raise MqttError("MQTT ping failed: %s" % err) from err
+            raise MqttConnectionError("MQTT ping failed: %s" % err) from err
 
 
 def connect_with_token_retry(session=None, host=None, port=None):

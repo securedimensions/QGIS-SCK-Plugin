@@ -112,4 +112,8 @@ MQTT_PUBLISH_TOPIC = "v1.1/ObservationGroups"
 MQTT_PUBLISH_QOS = 1
 MQTT_PUBLISH_TIMEOUT = 5
 MQTT_KEEP_ALIVE = 60
+# After Wi-Fi (or the broker) drops the TCP session, retry CONNECT without
+# blocking the QGIS UI on every 10s kit sample.
+MQTT_RECONNECT_TIMEOUT = 5
+MQTT_RECONNECT_BACKOFF = 10
 ELEVATION_API_URL = "https://api.open-elevation.com/api/v1/lookup"
