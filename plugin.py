@@ -83,12 +83,19 @@ from .maptool import (
     zoom_canvas_to_wgs84,
 )
 from .charts import MarkerChartOverlay
-from .kit import READING_ROWS, SerialWorker, list_serial_ports, sample_chart_point, serial_backend
+from .kit import (
+    READING_ROWS,
+    SerialWorker,
+    list_serial_ports,
+    sample_chart_point,
+    sck_id_from_mac,
+    serial_backend,
+)
 from .mqtt import MqttConnectionError, MqttError, MqttPublisher, MqttUnauthorized
 from .publish import SetupWorker, apply_sample, observation_group_payload
 from .publish_dialog import PublishConsentDialog
 from .places import PlacesClickFilter, PlacesLayerStore, PlacesWorker
-from .sta import StaClient, StaError, grid_system_from_landing, normalize_sta_base_url
+from .sta import StaClient, StaError, normalize_sta_base_url
 
 _logger = logging.getLogger("sck.plugin")
 
@@ -119,7 +126,8 @@ class SckDock(QDockWidget):
         self.sta_url_edit.editingFinished.connect(lambda: self.plugin.commit_sta_url(notify=False))
         self.validate_url_btn = QPushButton("Validate")
         self.validate_url_btn.setToolTip(
-            "Check the SensorThings URL and log the MQTT domain and port from the v1.1 landing page."
+            "Check the SensorThings URL and log the MQTT domain and port from the v1.1 landing page. "
+            "Required before Start publishing."
         )
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
@@ -226,6 +234,7 @@ class SckDock(QDockWidget):
         layout.addWidget(self.log_view)
         self.setWidget(container)
 
+        self.sta_url_edit.textChanged.connect(self.refresh)
         self.validate_url_btn.clicked.connect(self.plugin.validate_sta_url)
         self.sign_in_btn.clicked.connect(self.plugin.sign_in)
         self.sign_out_btn.clicked.connect(self.plugin.sign_out)
@@ -269,8 +278,10 @@ class SckDock(QDockWidget):
         self.validate_url_btn.setEnabled(not url_locked)
         self.sign_in_btn.setEnabled(not usable or self.plugin.mqtt_needs_sign_in())
         self.sign_out_btn.setEnabled(signed_in)
+        url_validated = self.plugin.sta_url_validated()
         ready = (
             signed_in
+            and url_validated
             and self.plugin.kit_connected
             and self.plugin.marker_confirmed
             and bool(self.plugin.kit_mac)
@@ -290,9 +301,11 @@ class SckDock(QDockWidget):
         elif not signed_in:
             self.publish_hint.setText("Sign in to publish.")
         elif not self.plugin.kit_connected or not self.plugin.kit_mac:
-            self.publish_hint.setText("Connect the kit (MAC becomes sck_id) before publishing.")
+            self.publish_hint.setText("Connect the kit before publishing.")
         elif not self.plugin.marker_confirmed:
             self.publish_hint.setText("Confirm the Thing marker before publishing.")
+        elif not url_validated:
+            self.publish_hint.setText("Click Validate to check the SensorThings URL before publishing.")
         else:
             self.publish_hint.setText("")
         self.confirm_btn.setEnabled(self.plugin.lat is not None and self.plugin.lon is not None)
@@ -322,6 +335,8 @@ class SckDock(QDockWidget):
         if ready:
             return "Create STAplus Datastreams and start MQTT publishing."
         missing = []
+        if not self.plugin.sta_url_validated():
+            missing.append("click Validate to check the SensorThings URL")
         if not signed_in:
             missing.append("sign in with AUTHENIX")
         if not self.plugin.kit_connected or not self.plugin.kit_mac:
@@ -463,6 +478,7 @@ class SckPlugin:
         self.publishing = False
         self.publish_config = None
         self.mqtt_publisher = None
+        self.validated_sta_url = None
         self._clear_mqtt_backoff()
         self.setup_worker = None
         self._chart_history = []
@@ -511,7 +527,7 @@ class SckPlugin:
         self._sync_cursor_hint()
 
         log_info("STAplus SCK plugin loaded")
-        self._probe_sta_landing()
+        log_info("STA endpoint: %s" % self.sta_base_url())
         session = authenix.load_session() or {}
         if session.get("access_token"):
             user = session.get("user") or {}
@@ -656,13 +672,20 @@ class SckPlugin:
         self.show_dock()
         if not self.commit_sta_url():
             return
+        if not self.sta_url_validated():
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                "SensorThings URL",
+                "Click Validate to check the SensorThings URL before publishing.",
+            )
+            return
         if self.publishing or self.setup_busy():
             return
         if not self.kit_connected or not self.kit_mac:
             QMessageBox.warning(
                 self.iface.mainWindow(),
                 "No kit",
-                "Connect the Smart Citizen Kit first. Its MAC address is stored as Thing properties.sck_id.",
+                "Connect the Smart Citizen Kit first. Thing properties.sck_id is the SHA-256 of its MAC.",
             )
             return
         if not self.marker_confirmed or self.lat is None or self.lon is None:
@@ -979,11 +1002,11 @@ class SckPlugin:
         self.serial_worker.start()
 
     def on_serial_connected(self, port, mac=None):
-        """Serial port opened, kit MAC read, and SCK monitor started."""
+        """Serial port opened, kit id hashed from the MAC, and SCK monitor started."""
         self.kit_connected = True
         self.serial_stopping = False
         self.last_sck_port = port
-        self.kit_mac = (mac or "").strip() or None
+        self.kit_mac = sck_id_from_mac(mac) or None
         self._save_sck_port(port)
         if self.kit_mac:
             self._save_sck_id(self.kit_mac)
@@ -995,9 +1018,9 @@ class SckPlugin:
                 self.chart_overlay.set_anchor(self.lat, self.lon)
         if self.dock is not None:
             if self.kit_mac:
-                self.dock.serial_status.setText("Connected: %s · MAC %s" % (port, self.kit_mac))
+                self.dock.serial_status.setText("Connected: %s · sck_id %s" % (port, self.kit_mac))
             else:
-                self.dock.serial_status.setText("Connected: %s · MAC unknown" % port)
+                self.dock.serial_status.setText("Connected: %s · kit id unknown" % port)
             self.dock.clear_readings()
             self.dock.refresh()
         if self.kit_mac:
@@ -1359,9 +1382,23 @@ class SckPlugin:
             self._note("SensorThings service set to %s" % url)
         return True
 
+    def sta_url_validated(self):
+        """True after Validate succeeded for the SensorThings URL currently in the dock."""
+        validated = self.validated_sta_url
+        if not validated or self.dock is None or not hasattr(self.dock, "sta_url_edit"):
+            return False
+        try:
+            current = normalize_sta_base_url(self.dock.sta_url_edit.text())
+        except StaError:
+            return False
+        return current == validated
+
     def validate_sta_url(self):
         """Rewrite the URL to v1.1, then log the MQTT domain and port from the landing page."""
         self.show_dock()
+        self.validated_sta_url = None
+        if self.dock is not None:
+            self.dock.refresh()
         if not self.commit_sta_url():
             return
         url = self.sta_base_url()
@@ -1370,44 +1407,23 @@ class SckPlugin:
             client = self._sta_client()
             landing = client.landing_page()
             broker = client.mqtt_broker(landing)
+        except authenix.AuthError as err:
+            self._note(str(err), Qgis.MessageLevel.Warning)
+            return
         except Exception as err:
             self._note(
                 "SensorThings URL is not usable: %s" % err,
                 Qgis.MessageLevel.Warning,
             )
             return
+        self.validated_sta_url = url
+        if self.dock is not None:
+            self.dock.refresh()
         self._note(
             "SensorThings URL is valid. MQTT domain %s, port %s."
             % (broker["host"], broker["port"]),
             Qgis.MessageLevel.Success,
         )
-
-    def _probe_sta_landing(self, announce=False):
-        """GET the v1.1 root document and log MQTT domain and port from the create-observations key."""
-        url = self.sta_base_url()
-        log_info("STA endpoint: %s" % url)
-        try:
-            client = self._sta_client()
-            landing = client.landing_page()
-            broker = client.mqtt_broker(landing)
-            message = "MQTT broker from STA v1.1 landing page: %s:%s (%s)" % (
-                broker["host"],
-                broker["port"],
-                broker["uri"],
-            )
-            log_info(message)
-            if announce and self.dock is not None:
-                self.dock.append_log(message)
-            grid_system = grid_system_from_landing(landing)
-            if grid_system:
-                log_info("DGGS gridSystem from STA landing page: %s" % grid_system)
-        except Exception as err:
-            log_warning("Could not read MQTT endpoint from STA v1.1 landing page: %s" % err)
-            if announce:
-                self._note(
-                    "Could not read MQTT host and port from %s: %s" % (url, err),
-                    Qgis.MessageLevel.Warning,
-                )
 
     def _read_sta_url(self):
         """Last SensorThings base URL stored under SETTINGS_GROUP."""
@@ -1452,16 +1468,26 @@ class SckPlugin:
             settings.endGroup()
 
     def _read_sck_id(self):
-        """Last kit MAC (Thing properties.sck_id) stored under SETTINGS_GROUP."""
+        """Last kit identifier (SHA-256 of the MAC) stored under SETTINGS_GROUP.
+
+        A previously saved station MAC is hashed and replaced so settings no longer keep it.
+        """
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:
-            return str(settings.value(SCK_ID_KEY) or "").strip() or None
+            stored = str(settings.value(SCK_ID_KEY) or "").strip()
         finally:
             settings.endGroup()
+        if not stored:
+            return None
+        sck_id = sck_id_from_mac(stored)
+        if sck_id and sck_id != stored:
+            self._save_sck_id(sck_id)
+        return sck_id or None
 
     def _save_sck_id(self, sck_id):
-        """Remember the last kit MAC used as sck_id."""
+        """Remember the last hashed kit id used as Thing properties.sck_id."""
+        sck_id = sck_id_from_mac(sck_id)
         settings = QgsSettings()
         settings.beginGroup(SETTINGS_GROUP)
         try:

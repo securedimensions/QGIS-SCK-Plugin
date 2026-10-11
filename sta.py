@@ -38,6 +38,7 @@ from .config import (
     THING_NAME,
 )
 from .h3cell import latlng_to_cell
+from .kit import sck_id_from_mac
 
 _logger = logging.getLogger("sck.sta")
 
@@ -189,29 +190,23 @@ class StaClient:
         """Bearer token used on the current request."""
         return self.session.get("access_token") or ""
 
-    def _headers(self, authenticate=True):
-        """JSON Accept. Bearer is sent for writes and for every Party request."""
-        headers = {"Accept": "application/json"}
-        if authenticate:
-            token = self.access_token()
-            if token:
-                headers["Authorization"] = "Bearer %s" % token
-        return headers
+    def _headers(self):
+        """JSON Accept and the AUTHENIX Bearer token. Every STAplus request sends it."""
+        token = self.access_token()
+        if not token:
+            raise authenix.AuthError("Not signed in. Sign in with AUTHENIX first.")
+        return {
+            "Accept": "application/json",
+            "Authorization": "Bearer %s" % token,
+        }
 
-    def request(self, method, path, payload=None, params=None, authenticate=None):
-        """Send one STAplus request.
-
-        GET/HEAD are unauthenticated, except Party, which always sends the access token.
-        Writes send Bearer.
-        """
+    def request(self, method, path, payload=None, params=None):
+        """Send one STAplus request. The access token is always sent as a Bearer header."""
         method = method.upper()
-        if _is_party_path(path):
-            authenticate = True
-        elif authenticate is None:
-            authenticate = method not in ("GET", "HEAD", "OPTIONS")
         href = path if path.startswith("http") else urljoin(self.base_url, path.lstrip("/"))
+        headers = self._headers()
         kwargs = {
-            "headers": self._headers(authenticate),
+            "headers": headers,
             "timeout": 60,
             "proxies": {},
         }
@@ -219,7 +214,7 @@ class StaClient:
             kwargs["params"] = params
         if payload is not None:
             kwargs["data"] = json.dumps(payload, default=str).encode("utf-8")
-            kwargs["headers"]["Content-Type"] = "application/json"
+            headers["Content-Type"] = "application/json"
         _logger.info("%s %s", method, href)
         try:
             response = self._http.request(method, href, **kwargs)
@@ -227,12 +222,8 @@ class StaClient:
             raise StaError("STAplus request failed: %s" % err) from err
 
         if response.status_code == 401:
-            if authenticate:
-                raise authenix.AuthError(
-                    "STAplus HTTP 401. Click Sign in and try again."
-                )
-            raise StaError(
-                _format_http_error(response, href, "", payload)
+            raise authenix.AuthError(
+                "STAplus HTTP 401. Click Sign in and try again."
             )
 
         if response.status_code >= 400:
@@ -240,9 +231,7 @@ class StaClient:
                 response.headers.get("Location") or response.headers.get("location") or ""
             ).strip() or None
             raise StaError(
-                _format_http_error(
-                    response, href, self.access_token() if authenticate else "", payload
-                ),
+                _format_http_error(response, href, self.access_token(), payload),
                 status_code=response.status_code,
                 location=location,
                 body=response.text,
@@ -254,13 +243,9 @@ class StaClient:
         except ValueError:
             return {"raw": response.text}
 
-    def get(self, path, params=None, authenticate=False):
-        """GET a STAplus collection or entity.
-
-        Reads are public by default. Party requests always send the access token.
-        Pass authenticate=True for any other read that depends on the signed-in user.
-        """
-        return self.request("GET", path, params=params, authenticate=authenticate)
+    def get(self, path, params=None):
+        """GET a STAplus collection or entity. The access token is always sent."""
+        return self.request("GET", path, params=params)
 
     def post(self, path, payload):
         """POST a new STAplus entity (Bearer required)."""
@@ -271,7 +256,7 @@ class StaClient:
         return self.request("PATCH", path, payload=payload)
 
     def landing_page(self):
-        """GET the STAplus root document (public read, no Bearer token)."""
+        """GET the STAplus root document. The access token is always sent."""
         return self.get("")
 
     def mqtt_broker(self, landing=None):
@@ -296,13 +281,16 @@ class StaClient:
     ):
         """Create Party, Thing, Location, PartyLocation, License instance if needed, and eight Datastreams.
 
-        One Thing per Party and kit MAC (name is always Smart Citizen Kit). A marker
-        position change adds a Location on that Thing. A marker name or position change
-        creates a new PartyLocation. Existing Locations are never patched.
+        One Thing per Party and kit (name is always Smart Citizen Kit). properties.sck_id
+        is the SHA-256 of the station MAC. A marker position change adds a Location on
+        that Thing. A marker name or position change creates a new PartyLocation.
+        Existing Locations are never patched.
         """
-        sck_id = str(sck_id or "").strip()
+        sck_id = sck_id_from_mac(sck_id)
         if not sck_id:
-            raise StaError("Connect the Smart Citizen Kit so its MAC can be used as sck_id.")
+            raise StaError(
+                "Connect the Smart Citizen Kit so its MAC can be hashed as sck_id."
+            )
         if lat is None or lon is None:
             raise StaError("Confirm a Thing location on the map before publishing.")
         user = self.session.get("user") or {}
@@ -375,7 +363,8 @@ class StaClient:
         return config
 
     def _prepare_publish_thing(self, thing, sck_id):
-        """Name the Thing Smart Citizen Kit and keep properties.sck_id = MAC."""
+        """Name the Thing Smart Citizen Kit and keep properties.sck_id as the MAC hash."""
+        sck_id = sck_id_from_mac(sck_id)
         props = dict(thing.get("properties") or {})
         props["plugin"] = "sck"
         props["source"] = props.get("source") or "qgis"
@@ -578,11 +567,7 @@ class StaClient:
         """
         if not sub:
             return None
-        found = self._query(
-            "Parties",
-            "authId eq me()",
-            authenticate=True,
-        )
+        found = self._query("Parties", "authId eq me()")
         return found[0] if found else None
 
     def list_template_licenses(self):
@@ -624,9 +609,9 @@ class StaClient:
         return template
 
     def _ensure_thing(self, party, sck_id=None, lat=None, lon=None, location_name=None):
-        """Reuse the Thing for this Party and kit MAC, or create one and add a Location."""
+        """Reuse the Thing for this Party and kit hash, or create one and add a Location."""
         party_id = party.get("@iot.id")
-        sck_id = str(sck_id or "").strip()
+        sck_id = sck_id_from_mac(sck_id)
         site_name = _location_name(location_name)
         found = []
         if sck_id:
@@ -707,9 +692,10 @@ class StaClient:
         return created
 
     def _patch_thing_sck_id(self, thing, sck_id):
-        """Set Thing properties.sck_id to the kit MAC (replaces the old numeric kit_id)."""
+        """Set Thing properties.sck_id to the SHA-256 of the kit MAC."""
+        sck_id = sck_id_from_mac(sck_id)
         props = dict(thing.get("properties") or {})
-        if props.get("sck_id") == sck_id and props.get("plugin") == "sck":
+        if not sck_id or (props.get("sck_id") == sck_id and props.get("plugin") == "sck"):
             return thing
         props["plugin"] = "sck"
         if not props.get("source"):
@@ -789,13 +775,13 @@ class StaClient:
     def _find_foi_by_osm_key(self, key):
         """Find an existing FoI whose description contains osm:type/id."""
         quoted = _odata_quote(key)
-        for expr in (
-            "contains(description,%s)" % quoted,
+        # FROST uses the OData 2.0 function: substringof(needle, field).
+        found = self._query(
+            "FeaturesOfInterest",
             "substringof(%s,description)" % quoted,
-        ):
-            found = self._query("FeaturesOfInterest", expr)
-            if found:
-                return found[0]
+        )
+        if found:
+            return found[0]
         return None
 
     def _ensure_feature_of_interest(self):
@@ -829,13 +815,13 @@ class StaClient:
         )
         return foi
 
-    def _query(self, collection, filter_expr, expand=None, top=5, authenticate=False):
+    def _query(self, collection, filter_expr, expand=None, top=5):
         """OData $filter lookup; returns [] if the query fails so callers can fall back to create."""
         params = {"$filter": filter_expr, "$top": str(top)}
         if expand:
             params["$expand"] = expand
         try:
-            data = self.get(collection, params=params, authenticate=authenticate)
+            data = self.get(collection, params=params)
         except StaError as err:
             _logger.warning("Query %s failed: %s", collection, err)
             return []
@@ -957,15 +943,6 @@ def _entity_from_location_header(response):
     if iot_id is not None:
         entity["@iot.id"] = iot_id
     return entity
-
-
-def _is_party_path(path):
-    """True when the URL addresses the Parties collection or one Party."""
-    text = str(path or "").split("?")[0].rstrip("/")
-    for segment in text.split("/"):
-        if segment == "Parties" or segment.startswith("Parties("):
-            return True
-    return False
 
 
 def _odata_quote(value):

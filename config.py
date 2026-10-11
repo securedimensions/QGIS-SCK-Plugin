@@ -104,7 +104,7 @@ MARKER_MAP_SCALE = 25000
 SCK_BAUD = 115200
 SCK_SAMPLE_INTERVAL = 10
 SCK_PORT_KEY = "sck_port"
-# Last kit MAC written as Thing properties.sck_id (replaces the old numeric kit_id).
+# Last kit identifier: SHA-256 hex of the station MAC, written as Thing properties.sck_id.
 SCK_ID_KEY = "sck_id"
 THING_NAME = "Smart Citizen Kit"
 CHART_WINDOW_S = 30 * 60

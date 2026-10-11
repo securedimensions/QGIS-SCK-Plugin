@@ -16,6 +16,7 @@
 """Smart Citizen Kit serial connection and monitor-line parsing."""
 
 import errno
+import hashlib
 import logging
 import math
 import os
@@ -39,6 +40,7 @@ SCK_MONITOR_CMD = (
 _MAC_RE = re.compile(
     r"(?i)(?:sta\s+)?mac(?:\s*address)?\s*:\s*([0-9a-f]{2}(?::[0-9a-f]{2}){5})"
 )
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _LINK_LOST_ERRNOS = frozenset({
     errno.EIO,
@@ -112,6 +114,24 @@ def parse_sck_mac(data):
     if len(parts) != 6:
         return None
     return ":".join(part.upper() for part in parts)
+
+
+def sck_id_from_mac(mac):
+    """SHA-256 hex of the kit station MAC. This value is Thing properties.sck_id.
+
+    The MAC is canonicalized to uppercase colon form (AA:BB:CC:DD:EE:FF) before
+    hashing. A value that is already 64 lowercase hex characters is returned unchanged.
+    """
+    text = str(mac or "").strip()
+    if not text:
+        return ""
+    if _SHA256_RE.fullmatch(text):
+        return text
+    compact = re.sub(r"[^0-9A-Fa-f]", "", text)
+    if len(compact) != 12:
+        return ""
+    canonical = ":".join(compact[i:i + 2].upper() for i in range(0, 12, 2))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _drain_lines(read_line, seconds, should_stop):
@@ -465,12 +485,13 @@ class SerialWorker(QThread):
             mac = query_kit_mac(sck.write, lambda: sck.readline(), lambda: self._stop)
             if self._stop:
                 return
+            sck_id = sck_id_from_mac(mac)
             sck.write(SCK_MONITOR_CMD.encode("ASCII"))
-            self.connected.emit(self.port, mac or "")
+            self.connected.emit(self.port, sck_id)
             _logger.info(
                 "SCK monitor started on %s (pyserial) sck_id=%s",
                 self.port,
-                mac or "(none)",
+                sck_id or "(none)",
             )
 
             port_watch = _PortWatch(self.port)
@@ -540,12 +561,13 @@ class SerialWorker(QThread):
             mac = query_kit_mac(write_cmd, read_line, lambda: self._stop)
             if self._stop:
                 return
+            sck_id = sck_id_from_mac(mac)
             write_cmd(SCK_MONITOR_CMD.encode("ASCII"))
-            self.connected.emit(self.port, mac or "")
+            self.connected.emit(self.port, sck_id)
             _logger.info(
                 "SCK monitor started on %s (QtSerialPort) sck_id=%s",
                 self.port,
-                mac or "(none)",
+                sck_id or "(none)",
             )
             port_watch = _PortWatch(self.port)
 
